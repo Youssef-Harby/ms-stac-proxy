@@ -93,7 +93,7 @@ var (
 	}
 
 	collectionPathRegex = regexp.MustCompile(`/collections/([^/?#]+)`)
-	blobURLRegex        = regexp.MustCompile(`https://\w+\.blob\.core\.windows\.net/[\w-]+/([^/]+)/[^?#]+(?:\.[^?#.]+)?`)
+	blobURLRegex        = regexp.MustCompile(`https://([^\.]+)\.blob\.core\.windows\.net/([^/]+)/([^"?\s]+)`)
 
 	shutdownCh = make(chan struct{})
 )
@@ -419,48 +419,100 @@ func transformSTACResponse(resp *http.Response, collectionID string) (*http.Resp
 }
 
 func signBlobURLs(content, token string) string {
-	blobURLs := []string{}
-	startIdx := 0
-	for {
-		startLoc := strings.Index(content[startIdx:], "https://")
-		if startLoc == -1 {
-			break
-		}
-		startLoc += startIdx
-
-		endLoc := -1
-		for i := startLoc; i < len(content); i++ {
-			if content[i] == '"' || content[i] == ' ' || content[i] == '\n' {
-				endLoc = i
-				break
-			}
-		}
-		if endLoc == -1 {
-			break
-		}
-
-		url := content[startLoc:endLoc]
-		if strings.Contains(url, ".blob.core.windows.net") && !strings.Contains(url, "?") {
-			blobURLs = append(blobURLs, url)
-		}
-		startIdx = endLoc
+	// Better regex to detect blob URLs with collection names
+	blobURLRegex := regexp.MustCompile(`https://([^\.]+)\.blob\.core\.windows\.net/([^/]+)/([^"?\s]+)`)
+	
+	// Find all matches in the content
+	matches := blobURLRegex.FindAllStringSubmatch(content, -1)
+	if len(matches) == 0 {
+		return content
 	}
-
+	
 	modifiedContent := content
 	signedCount := 0
-	for _, blobURL := range blobURLs {
-		signedURL := blobURL + "?" + token
+	
+	for _, match := range matches {
+		if len(match) < 4 {
+			continue // Skip if regex match is incomplete
+		}
+		
+		originalURL := match[0]
+		
+		// Skip URLs that already have a signature
+		if strings.Contains(originalURL, "?") {
+			continue
+		}
+		
+		// Important: The token is already a full SAS token with query parameters
+		// We need to make sure it's correctly applied as a query string
+		// First, check if token already starts with '?'
+		signedURL := originalURL
+		if strings.HasPrefix(token, "?") {
+			signedURL = originalURL + token
+		} else {
+			signedURL = originalURL + "?" + token
+		}
+		
+		// Replace in content, being careful to only replace when it's a complete URL
+		// This uses special indicators to ensure we're replacing complete URLs in JSON
 		modifiedContent = strings.Replace(
 			modifiedContent,
-			fmt.Sprintf("\"href\":\"%s\"", blobURL),
+			fmt.Sprintf("\"href\":\"%s\"", originalURL),
 			fmt.Sprintf("\"href\":\"%s\"", signedURL),
 			-1,
 		)
+		
+		// Also handle cases where URL appears in assets with a different format
+		modifiedContent = strings.Replace(
+			modifiedContent,
+			fmt.Sprintf("\"url\":\"%s\"", originalURL),
+			fmt.Sprintf("\"url\":\"%s\"", signedURL),
+			-1,
+		)
+		
 		signedCount++
 	}
-
+	
 	log.Printf("Signed %d blob URLs", signedCount)
 	return modifiedContent
+}
+
+func findCollectionInResponse(content string) string {
+	// First try to find collection ID through a root level property
+	collectionIDMatch := regexp.MustCompile(`"id":\s*"([^"]+)"`).FindStringSubmatch(content)
+	if len(collectionIDMatch) > 1 {
+		// Validate that it looks like a collection ID (no spaces, reasonable length)
+		if len(collectionIDMatch[1]) > 0 && len(collectionIDMatch[1]) < 100 && !strings.Contains(collectionIDMatch[1], " ") {
+			return collectionIDMatch[1]
+		}
+	}
+	
+	// Try to find collection ID from assets with blob URLs
+	blobMatches := regexp.MustCompile(`https://([^\.]+)\.blob\.core\.windows\.net/([^/]+)/`).FindStringSubmatch(content)
+	if len(blobMatches) > 2 {
+		// The blob storage account name is typically related to the collection
+		storageAccount := blobMatches[1]
+		containerName := blobMatches[2]
+		
+		// Some known mappings based on Microsoft Planetary Computer patterns
+		if storageAccount == "noaacdr" {
+			return "noaa-cdr-" + containerName
+		}
+		
+		// If no specific mapping, return the container name as a fallback
+		return containerName
+	}
+	
+	// Fallback
+	return ""
+}
+
+func extractCollection(path string) string {
+	collectionMatch := collectionPathRegex.FindStringSubmatch(path)
+	if len(collectionMatch) > 1 {
+		return collectionMatch[1]
+	}
+	return ""
 }
 
 func getTokenCached(collection string) (string, error) {
@@ -560,79 +612,38 @@ func fetchToken(collection string) (TokenResponse, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != statusOK {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return TokenResponse{}, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(respBody))
+	// Debug token fetch response status
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return TokenResponse{}, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
 	}
 
-	var tokenResp TokenResponse
+	// Parse the token response
+	var tokenResp struct {
+		Token        string    `json:"token"`
+		ExpiryString string    `json:"msft:expiry"`
+		Expiry       time.Time `json:"-"`
+	}
+
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 		return TokenResponse{}, fmt.Errorf("decoding token response: %w", err)
 	}
 
-	if tokenResp.Token == "" {
-		return TokenResponse{}, fmt.Errorf("received empty token")
+	// Parse the expiry time
+	parsedExpiry, err := time.Parse(time.RFC3339, tokenResp.ExpiryString)
+	if err != nil {
+		// Fallback to a future time if parsing fails
+		parsedExpiry = time.Now().Add(1 * time.Hour)
+		log.Printf("Warning: Could not parse token expiry time %q: %v. Using default expiration.", tokenResp.ExpiryString, err)
 	}
 
-	if tokenResp.Expiry.IsZero() {
-		tokenResp.Expiry = time.Now().Add(1 * time.Hour)
-		log.Printf("No expiry in token response, using default 1 hour expiry")
-	}
+	// Debug successful token fetch
+	log.Printf("Token obtained for %s (expires: %s)", collection, parsedExpiry.Format(time.RFC3339))
 
-	log.Printf("Token obtained for %s (expires: %v)", collection, tokenResp.Expiry.Format(time.RFC3339))
-	return tokenResp, nil
-}
-
-func findCollectionInResponse(content string) string {
-	var stacDoc map[string]interface{}
-	if err := json.Unmarshal([]byte(content), &stacDoc); err == nil {
-		if collID, ok := stacDoc["collection"].(string); ok && collID != "" {
-			return collID
-		}
-
-		if collID, ok := stacDoc["id"].(string); ok && collID != "" {
-			return collID
-		}
-
-		if links, ok := stacDoc["links"].([]interface{}); ok {
-			for _, link := range links {
-				if linkMap, ok := link.(map[string]interface{}); ok {
-					if rel, ok := linkMap["rel"].(string); ok && rel == "collection" {
-						if href, ok := linkMap["href"].(string); ok {
-							matches := collectionPathRegex.FindStringSubmatch(href)
-							if len(matches) > 1 {
-								return matches[1]
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	matches := blobURLRegex.FindStringSubmatch(content)
-	if len(matches) > 1 {
-		return matches[1]
-	}
-
-	matches = collectionPathRegex.FindStringSubmatch(content)
-	if len(matches) > 1 {
-		coll := matches[1]
-		if !strings.Contains(coll, "{") && !strings.Contains(coll, "}") &&
-		   !strings.Contains(coll, "\"") && !strings.Contains(coll, "'") {
-			return coll
-		}
-	}
-
-	return "sentinel-2-l2a"
-}
-
-func extractCollection(path string) string {
-	matches := collectionPathRegex.FindStringSubmatch(path)
-	if len(matches) > 1 {
-		return matches[1]
-	}
-	return ""
+	return TokenResponse{
+		Token:  tokenResp.Token,
+		Expiry: parsedExpiry,
+	}, nil
 }
 
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
