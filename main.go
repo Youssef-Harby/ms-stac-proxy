@@ -10,31 +10,63 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/andybalholm/brotli"
 )
 
 const (
-	proxyPort      = 8080
-	targetBaseURL  = "https://planetarycomputer.microsoft.com"
-	tokenEndpoint  = "https://planetarycomputer.microsoft.com/api/sas/v1/token"
-	defaultTimeout = 30 * time.Second
-	tokenCacheFile = "token_cache.json"
-	savePeriod     = 5 * time.Minute // How often to save tokens to disk
+	defaultProxyPort      = 8080
+	defaultTargetBaseURL  = "https://planetarycomputer.microsoft.com"
+	defaultTokenEndpoint  = "https://planetarycomputer.microsoft.com/api/sas/v1/token"
+	defaultTokenCacheFile = "token_cache.json"
+	defaultTimeout        = 30 * time.Second
+	defaultSavePeriod     = 5 * time.Minute
+	defaultRetryAttempts  = 3
+	defaultRetryDelay     = 500 * time.Millisecond
 )
 
-// TokenResponse represents the response from token API
+const (
+	headerContentType     = "Content-Type"
+	headerContentEncoding = "Content-Encoding"
+	headerContentLength   = "Content-Length"
+	headerHost            = "Host"
+	headerUserAgent       = "User-Agent"
+	headerAccept          = "Accept"
+	headerXForwardedFor   = "X-Forwarded-For"
+	headerXForwardedHost  = "X-Forwarded-Host"
+)
+
+const (
+	statusOK                  = http.StatusOK
+	statusBadRequest          = http.StatusBadRequest
+	statusInternalServerError = http.StatusInternalServerError
+	statusBadGateway          = http.StatusBadGateway
+)
+
+type Config struct {
+	ProxyPort      int
+	TargetBaseURL  string
+	TokenEndpoint  string
+	TokenCacheFile string
+	Timeout        time.Duration
+	SavePeriod     time.Duration
+	RetryAttempts  int
+	RetryDelay     time.Duration
+}
+
 type TokenResponse struct {
 	Token  string    `json:"token"`
 	Expiry time.Time `json:"msft:expiry"`
 }
 
-// Cache for tokens to reduce API calls
 type TokenCache struct {
 	mu           sync.RWMutex
 	tokens       map[string]TokenResponse
@@ -42,383 +74,352 @@ type TokenCache struct {
 	dirty        bool // Indicates if there are unsaved changes
 }
 
-// Global token cache
-var tokenCache = TokenCache{
-	tokens:       make(map[string]TokenResponse),
-	lastSaveTime: time.Now(),
-}
+var (
+	config Config
 
-var collectionRegex = regexp.MustCompile(`/collections/([^/]+)`)
+	tokenCache = TokenCache{
+		tokens:       make(map[string]TokenResponse),
+		lastSaveTime: time.Now(),
+	}
+
+	httpClient = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConnsPerHost: 100,
+			MaxConnsPerHost:     1000,
+			IdleConnTimeout:     90 * time.Second,
+			DisableCompression:  false, // Allow compression
+			ForceAttemptHTTP2:   true,  // Attempt HTTP/2
+		},
+	}
+
+	collectionPathRegex = regexp.MustCompile(`/collections/([^/?#]+)`)
+	blobURLRegex        = regexp.MustCompile(`https://\w+\.blob\.core\.windows\.net/[\w-]+/([^/]+)/[^?#]+(?:\.[^?#.]+)?`)
+
+	shutdownCh = make(chan struct{})
+)
+
+func loadConfig() Config {
+	cfg := Config{
+		ProxyPort:      defaultProxyPort,
+		TargetBaseURL:  defaultTargetBaseURL,
+		TokenEndpoint:  defaultTokenEndpoint,
+		TokenCacheFile: defaultTokenCacheFile,
+		Timeout:        defaultTimeout,
+		SavePeriod:     defaultSavePeriod,
+		RetryAttempts:  defaultRetryAttempts,
+		RetryDelay:     defaultRetryDelay,
+	}
+
+	if port := os.Getenv("PROXY_PORT"); port != "" {
+		if p, err := strconv.Atoi(port); err == nil && p > 0 {
+			cfg.ProxyPort = p
+		}
+	}
+
+	if url := os.Getenv("TARGET_BASE_URL"); url != "" {
+		cfg.TargetBaseURL = url
+	}
+
+	if endpoint := os.Getenv("TOKEN_ENDPOINT"); endpoint != "" {
+		cfg.TokenEndpoint = endpoint
+	}
+
+	if cacheFile := os.Getenv("TOKEN_CACHE_FILE"); cacheFile != "" {
+		cfg.TokenCacheFile = cacheFile
+	}
+
+	if timeout := os.Getenv("REQUEST_TIMEOUT"); timeout != "" {
+		if d, err := time.ParseDuration(timeout); err == nil {
+			cfg.Timeout = d
+		}
+	}
+
+	if savePeriod := os.Getenv("SAVE_PERIOD"); savePeriod != "" {
+		if d, err := time.ParseDuration(savePeriod); err == nil {
+			cfg.SavePeriod = d
+		}
+	}
+
+	if retries := os.Getenv("RETRY_ATTEMPTS"); retries != "" {
+		if r, err := strconv.Atoi(retries); err == nil && r >= 0 {
+			cfg.RetryAttempts = r
+		}
+	}
+
+	if delay := os.Getenv("RETRY_DELAY"); delay != "" {
+		if d, err := time.ParseDuration(delay); err == nil {
+			cfg.RetryDelay = d
+		}
+	}
+
+	httpClient.Timeout = cfg.Timeout
+
+	return cfg
+}
 
 func main() {
-	log.Printf("Starting direct proxy on port %d", proxyPort)
-	log.Printf("Target API: %s", targetBaseURL)
-	log.Printf("Token cache file: %s", tokenCacheFile)
-	
-	// Load saved tokens from disk
+	config = loadConfig()
+
+	log.Printf("Starting STAC Proxy on port %d", config.ProxyPort)
+	log.Printf("Target API: %s", config.TargetBaseURL)
+	log.Printf("Token cache file: %s", config.TokenCacheFile)
+
 	loadTokenCache()
-	
-	// Start background saving of token cache
-	go startTokenCacheSaver()
-	
-	// Setup graceful shutdown to save tokens
-	http.HandleFunc("/", handleProxyRequest)
+
+	cacheSaverDone := make(chan struct{})
+	go startTokenCacheSaver(cacheSaverDone)
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", corsMiddleware(handleProxyRequest))
 
 	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", proxyPort),
-		ReadHeaderTimeout: 5 * time.Second,
+		Addr:              fmt.Sprintf(":%d", config.ProxyPort),
+		Handler:           mux,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
-	log.Fatal(server.ListenAndServe())
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Error starting server: %v", err)
+		}
+	}()
+
+	<-sigChan
+	log.Println("Shutdown signal received, shutting down gracefully...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	close(shutdownCh)
+	close(cacheSaverDone)
+
+	if err := saveTokenCache(); err != nil {
+		log.Printf("Error saving token cache during shutdown: %v", err)
+	}
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Error during server shutdown: %v", err)
+	}
+
+	log.Println("Server gracefully stopped")
 }
 
-// loadTokenCache loads tokens from disk at startup
-func loadTokenCache() {
-	file, err := os.Open(tokenCacheFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			log.Printf("No token cache file found at %s, will create when tokens are fetched", tokenCacheFile)
-			return
-		}
-		log.Printf("Error opening token cache file: %v", err)
-		return
-	}
-	defer file.Close()
-
-	var loadedTokens map[string]TokenResponse
-	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&loadedTokens); err != nil {
-		log.Printf("Error decoding token cache: %v", err)
-		return
-	}
-
-	// Filter out expired tokens
-	now := time.Now()
-	validTokens := 0
-	expiredTokens := 0
-
-	tokenCache.mu.Lock()
-	for collection, token := range loadedTokens {
-		if now.Before(token.Expiry) {
-			tokenCache.tokens[collection] = token
-			validTokens++
-		} else {
-			expiredTokens++
-		}
-	}
-	tokenCache.mu.Unlock()
-
-	log.Printf("Loaded %d valid tokens from cache (discarded %d expired)", validTokens, expiredTokens)
-}
-
-// saveTokenCache saves tokens to disk
-func saveTokenCache() error {
-	tokenCache.mu.RLock()
-	if !tokenCache.dirty {
-		tokenCache.mu.RUnlock()
-		return nil // Skip saving if no changes
-	}
-	
-	// Create a copy of tokens to avoid holding the lock during I/O
-	tokenCopy := make(map[string]TokenResponse)
-	for k, v := range tokenCache.tokens {
-		tokenCopy[k] = v
-	}
-	tokenCache.mu.RUnlock()
-
-	// Create directory if it doesn't exist
-	dir := filepath.Dir(tokenCacheFile)
-	if dir != "." && dir != "/" {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("creating directory for token cache: %w", err)
-		}
-	}
-
-	// Use a temporary file and atomic rename to avoid corruption
-	tempFile := tokenCacheFile + ".tmp"
-	file, err := os.Create(tempFile)
-	if err != nil {
-		return fmt.Errorf("creating token cache file: %w", err)
-	}
-
-	encoder := json.NewEncoder(file)
-	if err := encoder.Encode(tokenCopy); err != nil {
-		file.Close()
-		return fmt.Errorf("encoding token cache: %w", err)
-	}
-
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("closing token cache file: %w", err)
-	}
-
-	// Atomic rename
-	if err := os.Rename(tempFile, tokenCacheFile); err != nil {
-		return fmt.Errorf("renaming token cache file: %w", err)
-	}
-
-	// Mark as saved
-	tokenCache.mu.Lock()
-	tokenCache.dirty = false
-	tokenCache.lastSaveTime = time.Now()
-	tokenCache.mu.Unlock()
-
-	log.Printf("Saved %d tokens to cache file", len(tokenCopy))
-	return nil
-}
-
-// startTokenCacheSaver runs a background goroutine to periodically save tokens
-func startTokenCacheSaver() {
-	ticker := time.NewTicker(savePeriod)
+func startTokenCacheSaver(done <-chan struct{}) {
+	ticker := time.NewTicker(config.SavePeriod)
 	defer ticker.Stop()
 
 	for {
-		<-ticker.C
-		if err := saveTokenCache(); err != nil {
-			log.Printf("Error saving token cache: %v", err)
+		select {
+		case <-ticker.C:
+			if err := saveTokenCache(); err != nil {
+				log.Printf("Error saving token cache: %v", err)
+			}
+		case <-done:
+			log.Println("Token cache saver stopped")
+			return
+		case <-shutdownCh:
+			return
 		}
 	}
-}
-
-func extractCollection(path string) string {
-	matches := collectionRegex.FindStringSubmatch(path)
-	if len(matches) > 1 {
-		return matches[1]
-	}
-	return ""
 }
 
 func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Received request: %s %s", r.Method, r.URL.Path)
 
-	// Extract collection from path - useful for token fetching later
 	collection := extractCollection(r.URL.Path)
 	if collection != "" {
 		log.Printf("Detected collection: %s", collection)
 	}
 
-	// Create the target URL
-	targetURL := fmt.Sprintf("%s%s", targetBaseURL, r.URL.Path)
+	targetURL := fmt.Sprintf("%s%s", config.TargetBaseURL, r.URL.Path)
 	if r.URL.RawQuery != "" {
-		targetURL += "?" + r.URL.RawQuery
+		targetURL = fmt.Sprintf("%s?%s", targetURL, r.URL.RawQuery)
 	}
 
-	// Create a context with timeout
-	ctx, cancel := context.WithTimeout(r.Context(), defaultTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), config.Timeout)
 	defer cancel()
 
-	// Create the request to the target API
-	req, err := http.NewRequestWithContext(ctx, r.Method, targetURL, nil)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Error creating request: %v", err), http.StatusInternalServerError)
-		return
-	}
+	var proxyReq *http.Request
+	var err error
 
-	// Copy headers from the original request
-	for name, values := range r.Header {
-		// Skip host header which is set automatically
-		if strings.ToLower(name) != "host" {
-			for _, value := range values {
-				req.Header.Add(name, value)
-			}
+	if r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Error reading request body", statusInternalServerError)
+			log.Printf("Error reading request body: %v", err)
+			return
+		}
+		r.Body.Close()
+
+		proxyReq, err = http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(bodyBytes))
+		if err != nil {
+			http.Error(w, "Error creating request", statusInternalServerError)
+			log.Printf("Error creating request: %v", err)
+			return
+		}
+	} else {
+		proxyReq, err = http.NewRequestWithContext(ctx, r.Method, targetURL, nil)
+		if err != nil {
+			http.Error(w, "Error creating request", statusInternalServerError)
+			log.Printf("Error creating request: %v", err)
+			return
 		}
 	}
 
-	// Set the User-Agent
-	req.Header.Set("User-Agent", "DirectProxy/1.0")
-
-	// Create a client with reasonable timeouts
-	client := &http.Client{
-		Timeout: defaultTimeout,
-		Transport: &http.Transport{
-			IdleConnTimeout:     90 * time.Second,
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 20,
-			DisableCompression:  false, // Allow compression
-		},
+	for name, values := range r.Header {
+		if name == headerHost {
+			continue
+		}
+		for _, value := range values {
+			proxyReq.Header.Add(name, value)
+		}
 	}
 
-	// Send the request
-	resp, err := client.Do(req)
+	proxyReq.Header.Set(headerXForwardedFor, r.RemoteAddr)
+	proxyReq.Header.Set(headerXForwardedHost, r.Host)
+
+	resp, err := httpClient.Do(proxyReq)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Error forwarding request: %v", err), http.StatusBadGateway)
+		http.Error(w, "Error forwarding request", statusBadGateway)
+		log.Printf("Error forwarding request: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	// Check if it's a STAC API response that needs transformation
-	if isSTACResponse(resp) && strings.Contains(r.URL.Path, "/api/stac/v1") {
+	if isSTACResponse(resp) {
 		transformedResp, err := transformSTACResponse(resp, collection)
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Error transforming response: %v", err), http.StatusInternalServerError)
+			http.Error(w, "Error transforming response", statusInternalServerError)
+			log.Printf("Error transforming response: %v", err)
 			return
 		}
 		resp = transformedResp
 	}
 
-	// Copy response headers
+	// Copy response headers to client response
 	for name, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(name, value)
 		}
 	}
 
-	// Set status code
-	w.WriteHeader(resp.StatusCode)
+	// Ensure CORS headers are properly set on the response
+	origin := r.Header.Get("Origin")
+	if origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH")
+		w.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Requested-With, X-API-Key, Cache-Control, X-Requested-With")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Set("Access-Control-Max-Age", "3600")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Type, Cache-Control")
+	}
 
-	// Copy response body
-	_, err = io.Copy(w, resp.Body)
+	// Write status code and body
+	w.WriteHeader(resp.StatusCode)
+	
+	// Debug the response content
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if len(bodyBytes) == 0 {
+		log.Printf("Warning: Empty response body after transformation")
+	} else {
+		log.Printf("Response body length: %d bytes", len(bodyBytes))
+	}
+	
+	// Write the body to the response
+	_, err = w.Write(bodyBytes)
 	if err != nil {
-		log.Printf("Error copying response body: %v", err)
-		return
+		log.Printf("Error writing response body: %v", err)
 	}
 
 	log.Printf("Successfully proxied request: %s %s -> %d", r.Method, r.URL.Path, resp.StatusCode)
 }
 
 func isSTACResponse(resp *http.Response) bool {
-	contentType := resp.Header.Get("Content-Type")
-	return strings.Contains(strings.ToLower(contentType), "json") &&
-		resp.StatusCode == http.StatusOK &&
-		resp.ContentLength != 0
+	contentType := resp.Header.Get(headerContentType)
+	return strings.Contains(contentType, "application/json") ||
+		   strings.Contains(contentType, "application/geo+json") ||
+		   strings.Contains(contentType, "application/stac") ||
+		   strings.Contains(contentType, "application/ld+json")
 }
 
-func transformSTACResponse(resp *http.Response, requestedCollection string) (*http.Response, error) {
-	log.Printf("Transforming STAC response with Content-Type: %s, Content-Encoding: %s",
-		resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"))
+func transformSTACResponse(resp *http.Response, collectionID string) (*http.Response, error) {
+	contentType := resp.Header.Get(headerContentType)
+	contentEncoding := resp.Header.Get(headerContentEncoding)
 
-	// Read and decompress response body
-	var bodyBytes []byte
+	log.Printf("Transforming STAC response with Content-Type: %s, Content-Encoding: %s", contentType, contentEncoding)
+
+	// Clone the original headers first to preserve them
+	preservedHeaders := resp.Header.Clone()
+
+	var reader io.ReadCloser
 	var err error
-	contentEncoding := resp.Header.Get("Content-Encoding")
 
 	switch contentEncoding {
 	case "gzip":
-		reader, err := gzip.NewReader(resp.Body)
+		reader, err = gzip.NewReader(resp.Body)
 		if err != nil {
 			return nil, fmt.Errorf("creating gzip reader: %w", err)
 		}
 		defer reader.Close()
-		bodyBytes, err = io.ReadAll(reader)
-		if err != nil {
-			return nil, fmt.Errorf("reading gzipped body: %w", err)
-		}
-
 	case "br":
-		reader := brotli.NewReader(resp.Body)
-		bodyBytes, err = io.ReadAll(reader)
-		if err != nil {
-			return nil, fmt.Errorf("reading brotli body: %w", err)
-		}
-
+		reader = io.NopCloser(brotli.NewReader(resp.Body))
 	default:
-		bodyBytes, err = io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("reading response body: %w", err)
-		}
+		reader = resp.Body
 	}
 
-	// Process the response body
-	bodyStr := string(bodyBytes)
-	
-	// Determine which collection to use for token fetching
-	collection := ""
-	
-	// First priority: use the collection from the request path if available
-	if requestedCollection != "" {
-		collection = requestedCollection
-	} else {
-		// Second priority: try to extract collection from the response body
-		var stacDoc map[string]interface{}
-		if err := json.Unmarshal(bodyBytes, &stacDoc); err == nil {
-			// Try different fields that might contain collection info
-			if collID, ok := stacDoc["collection"].(string); ok && collID != "" {
-				collection = collID
-			} else if collID, ok := stacDoc["id"].(string); ok && collID != "" {
-				collection = collID
-			}
-		}
-		
-		// Third priority: try to extract from URLs in the response
-		if collection == "" {
-			matches := collectionRegex.FindStringSubmatch(bodyStr)
-			if len(matches) > 1 && matches[1] != "" {
-				collection = matches[1]
-			}
-		}
-		
-		// Fourth priority: use the default collection
-		if collection == "" {
-			collection = "sentinel-2-l2a"
-		}
-	}
-	
-	log.Printf("Using collection '%s' for token fetching", collection)
-	
-	// Get token for the identified collection
-	token, err := getTokenCached(collection)
+	bodyBytes, err := io.ReadAll(reader)
 	if err != nil {
-		log.Printf("Error getting token: %v", err)
-		// Continue without signing URLs if token fetch fails
-	} else {
-		log.Printf("Got token for collection %s", collection)
+		return nil, fmt.Errorf("reading response body: %w", err)
 	}
 
-	// Replace API URLs to point to our proxy
-	originalAPIBase := "https://planetarycomputer.microsoft.com"
-	proxyAPIBase := fmt.Sprintf("http://localhost:%d", proxyPort)
-	bodyStr = strings.ReplaceAll(bodyStr, originalAPIBase, proxyAPIBase)
+	bodyStr := string(bodyBytes)
 
-	// Find and sign blob URLs if we have a token
-	if token != "" {
-		bodyStr = signBlobURLs(bodyStr, token)
+	// Get collection ID for token if none provided
+	if collectionID == "" {
+		collectionID = findCollectionInResponse(bodyStr)
+		if collectionID != "" {
+			log.Printf("Using collection '%s' for token fetching", collectionID)
+		}
 	}
 
-	// Create new response
-	newResp := *resp // Copy the original response
+	// Sign blob URLs in the response if we have a collection ID
+	if collectionID != "" {
+		token, err := getTokenCached(collectionID)
+		if err != nil {
+			log.Printf("Error getting token: %v", err)
+		} else {
+			bodyStr = signBlobURLs(bodyStr, token)
+		}
+	}
+
+	// Replace API URLs
+	bodyStr = strings.ReplaceAll(bodyStr, config.TargetBaseURL, fmt.Sprintf("http://localhost:%d", config.ProxyPort))
+
+	// Create a new response with the modified body
+	newResp := *resp
 	
-	// For uncompressed responses, return the modified body as is
-	if contentEncoding == "" {
-		newResp.Body = io.NopCloser(strings.NewReader(bodyStr))
-		newResp.ContentLength = int64(len(bodyStr))
-		newResp.Header.Set("Content-Length", fmt.Sprintf("%d", len(bodyStr)))
-		return &newResp, nil
-	}
-
-	// For compressed responses, recompress with the same algorithm
-	var contentBuffer bytes.Buffer
-
-	switch contentEncoding {
-	case "gzip":
-		gzipWriter := gzip.NewWriter(&contentBuffer)
-		_, err := gzipWriter.Write([]byte(bodyStr))
-		if err != nil {
-			return nil, fmt.Errorf("compressing with gzip: %w", err)
-		}
-		if err := gzipWriter.Close(); err != nil {
-			return nil, fmt.Errorf("closing gzip writer: %w", err)
-		}
-
-	case "br":
-		brWriter := brotli.NewWriter(&contentBuffer)
-		_, err := brWriter.Write([]byte(bodyStr))
-		if err != nil {
-			return nil, fmt.Errorf("compressing with brotli: %w", err)
-		}
-		if err := brWriter.Close(); err != nil {
-			return nil, fmt.Errorf("closing brotli writer: %w", err)
-		}
-	}
-
-	newResp.Body = io.NopCloser(bytes.NewReader(contentBuffer.Bytes()))
-	newResp.ContentLength = int64(contentBuffer.Len())
-	newResp.Header.Set("Content-Length", fmt.Sprintf("%d", contentBuffer.Len()))
+	// Create new http.Response with original headers
+	newResp.Header = preservedHeaders.Clone()
+	
+	// Always return uncompressed content for simplicity
+	newResp.Body = io.NopCloser(strings.NewReader(bodyStr))
+	newResp.ContentLength = int64(len(bodyStr))
+	newResp.Header.Set(headerContentLength, fmt.Sprintf("%d", len(bodyStr)))
+	
+	// Remove content encoding header since we're returning uncompressed content
+	newResp.Header.Del(headerContentEncoding)
 
 	return &newResp, nil
 }
 
 func signBlobURLs(content, token string) string {
-	// Find blob URLs using simple string search
-	var blobURLs []string
+	blobURLs := []string{}
 	startIdx := 0
 	for {
 		startLoc := strings.Index(content[startIdx:], "https://")
@@ -427,7 +428,6 @@ func signBlobURLs(content, token string) string {
 		}
 		startLoc += startIdx
 
-		// Find the end of the URL (quote or space)
 		endLoc := -1
 		for i := startLoc; i < len(content); i++ {
 			if content[i] == '"' || content[i] == ' ' || content[i] == '\n' {
@@ -446,7 +446,6 @@ func signBlobURLs(content, token string) string {
 		startIdx = endLoc
 	}
 
-	// Replace blob URLs with signed versions in the content
 	modifiedContent := content
 	signedCount := 0
 	for _, blobURL := range blobURLs {
@@ -464,46 +463,84 @@ func signBlobURLs(content, token string) string {
 	return modifiedContent
 }
 
-// getTokenCached retrieves a token from cache or fetches a new one if needed
 func getTokenCached(collection string) (string, error) {
-	// Check cache first
 	tokenCache.mu.RLock()
 	cachedToken, exists := tokenCache.tokens[collection]
 	tokenCache.mu.RUnlock()
-	
-	// If token exists and is not expired, use it
+
 	if exists && time.Now().Before(cachedToken.Expiry) {
-		log.Printf("Using cached token for %s (expires in %v)", 
+		log.Printf("Using cached token for %s (expires in %v)",
 			collection, cachedToken.Expiry.Sub(time.Now()).Round(time.Second))
 		return cachedToken.Token, nil
 	}
-	
-	// Otherwise fetch a new token
-	tokenResp, err := fetchToken(collection)
+
+	var tokenResp TokenResponse
+	var err error
+
+	for attempt := 0; attempt < config.RetryAttempts; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(attempt) * config.RetryDelay
+			log.Printf("Retrying token fetch for %s (attempt %d/%d) after %v",
+				collection, attempt+1, config.RetryAttempts, backoff)
+			select {
+			case <-time.After(backoff):
+				// Continue with retry
+			case <-shutdownCh:
+				return "", fmt.Errorf("shutdown in progress")
+			}
+		}
+
+		tokenResp, err = fetchToken(collection)
+		if err == nil {
+			break
+		}
+
+		if !isRetryableError(err) {
+			break
+		}
+	}
+
 	if err != nil {
 		return "", err
 	}
-	
-	// Cache the new token
+
 	tokenCache.mu.Lock()
 	tokenCache.tokens[collection] = tokenResp
-	tokenCache.dirty = true // Mark that we have unsaved changes
+	tokenCache.dirty = true
 	tokenCache.mu.Unlock()
-	
-	// Save to disk immediately after getting a new token
+
 	go func() {
 		if err := saveTokenCache(); err != nil {
 			log.Printf("Error saving token cache: %v", err)
 		} else {
-			log.Printf("Saved token cache with %d entries to %s", len(tokenCache.tokens), tokenCacheFile)
+			log.Printf("Saved token cache with %d entries to %s", len(tokenCache.tokens), config.TokenCacheFile)
 		}
 	}()
-	
+
 	return tokenResp.Token, nil
 }
 
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if strings.Contains(err.Error(), "timeout") ||
+	   strings.Contains(err.Error(), "connection refused") ||
+	   strings.Contains(err.Error(), "no such host") ||
+	   strings.Contains(err.Error(), "network") {
+		return true
+	}
+
+	if strings.Contains(err.Error(), "status code: 5") {
+		return true
+	}
+
+	return false
+}
+
 func fetchToken(collection string) (TokenResponse, error) {
-	tokenURL := fmt.Sprintf("%s/%s", tokenEndpoint, collection)
+	tokenURL := fmt.Sprintf("%s/%s", config.TokenEndpoint, collection)
 	log.Printf("Fetching fresh token from %s", tokenURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -514,20 +551,16 @@ func fetchToken(collection string) (TokenResponse, error) {
 		return TokenResponse{}, fmt.Errorf("creating token request: %w", err)
 	}
 
-	req.Header.Set("User-Agent", "DirectProxy/1.0")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set(headerUserAgent, "STACProxy/1.0")
+	req.Header.Set(headerAccept, "application/json")
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return TokenResponse{}, fmt.Errorf("sending token request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != statusOK {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return TokenResponse{}, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(respBody))
 	}
@@ -541,7 +574,6 @@ func fetchToken(collection string) (TokenResponse, error) {
 		return TokenResponse{}, fmt.Errorf("received empty token")
 	}
 
-	// Set a default expiry if none provided
 	if tokenResp.Expiry.IsZero() {
 		tokenResp.Expiry = time.Now().Add(1 * time.Hour)
 		log.Printf("No expiry in token response, using default 1 hour expiry")
@@ -549,4 +581,165 @@ func fetchToken(collection string) (TokenResponse, error) {
 
 	log.Printf("Token obtained for %s (expires: %v)", collection, tokenResp.Expiry.Format(time.RFC3339))
 	return tokenResp, nil
+}
+
+func findCollectionInResponse(content string) string {
+	var stacDoc map[string]interface{}
+	if err := json.Unmarshal([]byte(content), &stacDoc); err == nil {
+		if collID, ok := stacDoc["collection"].(string); ok && collID != "" {
+			return collID
+		}
+
+		if collID, ok := stacDoc["id"].(string); ok && collID != "" {
+			return collID
+		}
+
+		if links, ok := stacDoc["links"].([]interface{}); ok {
+			for _, link := range links {
+				if linkMap, ok := link.(map[string]interface{}); ok {
+					if rel, ok := linkMap["rel"].(string); ok && rel == "collection" {
+						if href, ok := linkMap["href"].(string); ok {
+							matches := collectionPathRegex.FindStringSubmatch(href)
+							if len(matches) > 1 {
+								return matches[1]
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	matches := blobURLRegex.FindStringSubmatch(content)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+
+	matches = collectionPathRegex.FindStringSubmatch(content)
+	if len(matches) > 1 {
+		coll := matches[1]
+		if !strings.Contains(coll, "{") && !strings.Contains(coll, "}") &&
+		   !strings.Contains(coll, "\"") && !strings.Contains(coll, "'") {
+			return coll
+		}
+	}
+
+	return "sentinel-2-l2a"
+}
+
+func extractCollection(path string) string {
+	matches := collectionPathRegex.FindStringSubmatch(path)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+	return ""
+}
+
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			origin = "*"
+		}
+		
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH")
+		w.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Requested-With, X-API-Key, Cache-Control, X-Requested-With")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Set("Access-Control-Max-Age", "3600")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Type, Cache-Control")
+		
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		
+		next(w, r)
+	}
+}
+
+func loadTokenCache() {
+	file, err := os.Open(config.TokenCacheFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("No token cache file found at %s, will create when tokens are fetched", config.TokenCacheFile)
+			return
+		}
+		log.Printf("Error opening token cache file: %v", err)
+		return
+	}
+	defer file.Close()
+
+	var loadedTokens map[string]TokenResponse
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&loadedTokens); err != nil {
+		log.Printf("Error decoding token cache: %v", err)
+		return
+	}
+
+	now := time.Now()
+	validTokens := 0
+	expiredTokens := 0
+
+	tokenCache.mu.Lock()
+	for collection, token := range loadedTokens {
+		if now.Before(token.Expiry) {
+			tokenCache.tokens[collection] = token
+			validTokens++
+		} else {
+			expiredTokens++
+		}
+	}
+	tokenCache.mu.Unlock()
+
+	log.Printf("Loaded %d valid tokens from cache (discarded %d expired)", validTokens, expiredTokens)
+}
+
+func saveTokenCache() error {
+	tokenCache.mu.RLock()
+	if !tokenCache.dirty {
+		tokenCache.mu.RUnlock()
+		return nil
+	}
+
+	tokenCopy := make(map[string]TokenResponse)
+	for k, v := range tokenCache.tokens {
+		tokenCopy[k] = v
+	}
+	tokenCache.mu.RUnlock()
+
+	dir := filepath.Dir(config.TokenCacheFile)
+	if dir != "." && dir != "/" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("creating directory for token cache: %w", err)
+		}
+	}
+
+	tempFile := config.TokenCacheFile + ".tmp"
+	file, err := os.Create(tempFile)
+	if err != nil {
+		return fmt.Errorf("creating token cache file: %w", err)
+	}
+
+	encoder := json.NewEncoder(file)
+	if err := encoder.Encode(tokenCopy); err != nil {
+		file.Close()
+		return fmt.Errorf("encoding token cache: %w", err)
+	}
+
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("closing token cache file: %w", err)
+	}
+
+	if err := os.Rename(tempFile, config.TokenCacheFile); err != nil {
+		return fmt.Errorf("renaming token cache file: %w", err)
+	}
+
+	tokenCache.mu.Lock()
+	tokenCache.dirty = false
+	tokenCache.lastSaveTime = time.Now()
+	tokenCache.mu.Unlock()
+
+	log.Printf("Saved %d tokens to cache file", len(tokenCopy))
+	return nil
 }
