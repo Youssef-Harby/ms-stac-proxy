@@ -1,0 +1,33 @@
+# Compiled binary
+ms-stac-proxy
+direct-proxy
+
+# Token cache file
+token_cache.json
+token_cache.json.tmp
+
+# Go binary, test cache, and dependencies
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS-specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+build/
