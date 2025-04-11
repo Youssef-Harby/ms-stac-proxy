@@ -17,10 +17,12 @@ This proxy sits between your client application and the Microsoft Planetary Comp
 
 1. Intercepts requests to the STAC API
 2. Forwards them to the Microsoft Planetary Computer
-3. Detects which collection is being requested
+3. Detects which collection is being requested (with fallback to "default-collection" if none is found)
 4. Fetches and caches appropriate SAS tokens
-5. Transforms responses by signing Azure blob URLs
+5. Transforms responses by signing Azure blob URLs (excluding public assets storage)
 6. Returns the modified response to the client
+
+The proxy includes a visual dashboard-style startup display showing key information like the STAC API URL, GitHub repository, and target API.
 
 ## Setup
 
@@ -43,7 +45,7 @@ chmod +x setup.sh
 Start the proxy:
 
 ```bash
-go run direct-proxy.go
+go run main.go
 ```
 
 Or use the compiled binary after running the setup script:
@@ -52,7 +54,11 @@ Or use the compiled binary after running the setup script:
 ./ms-stac-proxy
 ```
 
-By default, the proxy runs on port 8080.
+By default, the proxy runs on port 8080 and provides a clear dashboard-style startup display with information about:
+- The STAC API URL (http://localhost:8080/api/stac/v1)
+- The GitHub repository link
+- The target Microsoft Planetary Computer API endpoint
+- Token cache file location
 
 ### Using Prebuilt Binaries
 
@@ -143,6 +149,30 @@ The proxy will automatically:
 3. Sign all Azure blob URLs in the response
 4. Return the processed response to your client
 
+## Token Handling and URL Signing
+
+The proxy handles authentication to Microsoft Planetary Computer by:
+
+- Automatically detecting collection IDs from request paths and response content
+- Fetching SAS tokens for the appropriate collection
+- Caching tokens in memory and on disk to minimize API calls
+- Intelligently signing Azure blob URLs with the correct token
+- Using a fallback "default-collection" when no specific collection is detected
+- Skipping token signing for public storage accounts (ai4edatasetspublicassets.blob.core.windows.net)
+
+This approach eliminates the need to manually manage tokens in your application.
+
+## CORS Support
+
+The proxy handles Cross-Origin Resource Sharing (CORS) automatically by:
+
+- Setting permissive CORS headers on all responses
+- Allowing requests from any origin
+- Handling preflight requests properly
+- Skipping duplicate CORS headers from upstream responses
+
+This makes it easy to use the API directly from web applications without CORS issues.
+
 ## Token Caching
 
 Tokens are cached in memory and persisted to disk in `token_cache.json`. This allows the proxy to:
@@ -154,14 +184,16 @@ Tokens are cached in memory and persisted to disk in `token_cache.json`. This al
 
 ## Configuration
 
-Configuration options are defined as constants in the source code:
+The proxy can be configured using environment variables:
 
-- `proxyPort`: The port the proxy listens on (default: 8080)
-- `targetBaseURL`: The base URL of the Microsoft Planetary Computer API
-- `tokenEndpoint`: The endpoint for fetching SAS tokens
-- `tokenCacheFile`: The file where tokens are persisted
-- `defaultTimeout`: Default timeout for HTTP requests
-- `savePeriod`: How often to save tokens to disk (also saved immediately upon fetching new tokens)
+- `PROXY_PORT`: The port the proxy listens on (default: 8080)
+- `TARGET_BASE_URL`: The base URL of the Microsoft Planetary Computer API (default: https://planetarycomputer.microsoft.com)
+- `TOKEN_ENDPOINT`: The endpoint for fetching SAS tokens (default: https://planetarycomputer.microsoft.com/api/sas/v1/token)
+- `TOKEN_CACHE_FILE`: The file where tokens are persisted (default: token_cache.json)
+- `REQUEST_TIMEOUT`: Timeout for HTTP requests (default: 60s)
+- `SAVE_PERIOD`: How often to save tokens to disk (default: 5m)
+- `RETRY_ATTEMPTS`: Number of retry attempts for failed requests (default: 3)
+- `RETRY_DELAY`: Delay between retry attempts (default: 500ms)
 
 ## License
 
