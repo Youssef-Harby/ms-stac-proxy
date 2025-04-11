@@ -140,6 +140,8 @@ func NewApplication() *Application {
 			"soils": true,
 			"gnatsgo-rasters": true,
 			"noaa-cdr-ocean-heat-content": true,
+			"cop-dem-glo-90": true,
+			"cop-dem-glo-30": true,
 			// Add other collections that need direct signing here
 		},
 	}
