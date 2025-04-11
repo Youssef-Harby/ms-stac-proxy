@@ -250,7 +250,6 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	var err error
 
 	if r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
-		// Read the body contents to determine its size for proper logging
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "Error reading request body", statusInternalServerError)
@@ -258,28 +257,12 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		r.Body.Close()
-		
-		log.Printf("Request body size: %d bytes", len(bodyBytes))
-		
+
 		proxyReq, err = http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(bodyBytes))
 		if err != nil {
 			http.Error(w, "Error creating request", statusInternalServerError)
 			log.Printf("Error creating request: %v", err)
 			return
-		}
-		
-		// Make sure content length is set correctly
-		proxyReq.ContentLength = int64(len(bodyBytes))
-		proxyReq.Header.Set(headerContentLength, fmt.Sprintf("%d", len(bodyBytes)))
-		
-		// Ensure content type is properly forwarded for POST requests
-		if contentType := r.Header.Get(headerContentType); contentType != "" {
-			proxyReq.Header.Set(headerContentType, contentType)
-		} else {
-			// Default to application/json for POST requests to search endpoint if not specified
-			if strings.Contains(r.URL.Path, "/search") {
-				proxyReq.Header.Set(headerContentType, "application/json")
-			}
 		}
 	} else {
 		proxyReq, err = http.NewRequestWithContext(ctx, r.Method, targetURL, nil)
@@ -320,36 +303,26 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 		resp = transformedResp
 	}
 
-	// Copy response headers to client response
+	// Copy response headers to client response, excluding CORS headers which are set by the middleware
 	for name, values := range resp.Header {
+		// Skip CORS headers as they're handled by our corsMiddleware
+		if strings.HasPrefix(strings.ToLower(name), "access-control-") {
+			continue
+		}
 		for _, value := range values {
 			w.Header().Add(name, value)
 		}
 	}
 
-	// Ensure CORS headers are properly set on the response
-	origin := r.Header.Get("Origin")
-	if origin != "" {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH")
-		w.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Requested-With, X-API-Key, Cache-Control, X-Requested-With")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-		w.Header().Set("Access-Control-Max-Age", "3600")
-		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Type, Cache-Control")
-	}
-
-	// Write status code and body
 	w.WriteHeader(resp.StatusCode)
-	
-	// Debug the response content
+
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	if len(bodyBytes) == 0 {
 		log.Printf("Warning: Empty response body after transformation")
 	} else {
 		log.Printf("Response body length: %d bytes", len(bodyBytes))
 	}
-	
-	// Write the body to the response
+
 	_, err = w.Write(bodyBytes)
 	if err != nil {
 		log.Printf("Error writing response body: %v", err)
@@ -361,9 +334,9 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 func isSTACResponse(resp *http.Response) bool {
 	contentType := resp.Header.Get(headerContentType)
 	return strings.Contains(contentType, "application/json") ||
-		   strings.Contains(contentType, "application/geo+json") ||
-		   strings.Contains(contentType, "application/stac") ||
-		   strings.Contains(contentType, "application/ld+json")
+		strings.Contains(contentType, "application/geo+json") ||
+		strings.Contains(contentType, "application/stac") ||
+		strings.Contains(contentType, "application/ld+json")
 }
 
 func transformSTACResponse(resp *http.Response, collectionID string) (*http.Response, error) {
@@ -371,9 +344,6 @@ func transformSTACResponse(resp *http.Response, collectionID string) (*http.Resp
 	contentEncoding := resp.Header.Get(headerContentEncoding)
 
 	log.Printf("Transforming STAC response with Content-Type: %s, Content-Encoding: %s", contentType, contentEncoding)
-
-	// Clone the original headers first to preserve them
-	preservedHeaders := resp.Header.Clone()
 
 	var reader io.ReadCloser
 	var err error
@@ -398,7 +368,7 @@ func transformSTACResponse(resp *http.Response, collectionID string) (*http.Resp
 
 	bodyStr := string(bodyBytes)
 
-	// Get collection ID for token if none provided
+	// If we don't have a collection ID yet, try to extract it from the response
 	if collectionID == "" {
 		collectionID = findCollectionInResponse(bodyStr)
 		if collectionID != "" {
@@ -406,160 +376,111 @@ func transformSTACResponse(resp *http.Response, collectionID string) (*http.Resp
 		}
 	}
 
-	// Sign blob URLs in the response if we have a collection ID
-	if collectionID != "" {
+	// Sign all blob URLs regardless of collection
+	if strings.Contains(bodyStr, ".blob.core.windows.net") {
 		token, err := getTokenCached(collectionID)
 		if err != nil {
-			log.Printf("Error getting token: %v", err)
+			log.Printf("Error getting token for collection %s: %v", collectionID, err)
 		} else {
 			bodyStr = signBlobURLs(bodyStr, token)
 		}
 	}
 
-	// Replace API URLs
 	bodyStr = strings.ReplaceAll(bodyStr, config.TargetBaseURL, fmt.Sprintf("http://localhost:%d", config.ProxyPort))
 
-	// Create a new response with the modified body
 	newResp := *resp
-	
-	// Create new http.Response with original headers
-	newResp.Header = preservedHeaders.Clone()
-	
-	// Always return uncompressed content for simplicity
+	newResp.Header = resp.Header.Clone()
 	newResp.Body = io.NopCloser(strings.NewReader(bodyStr))
 	newResp.ContentLength = int64(len(bodyStr))
 	newResp.Header.Set(headerContentLength, fmt.Sprintf("%d", len(bodyStr)))
-	
-	// Remove content encoding header since we're returning uncompressed content
 	newResp.Header.Del(headerContentEncoding)
 
 	return &newResp, nil
 }
 
-func findCollectionInResponse(content string) string {
-	// First try to find collection ID through a root level property
-	collectionIDMatch := regexp.MustCompile(`"collection":\s*"([^"]+)"`).FindStringSubmatch(content)
-	if len(collectionIDMatch) > 1 {
-		// Collection ID is explicitly mentioned
-		return collectionIDMatch[1]
-	}
-
-	// Try to find collection ID through the features array
-	collectionIDMatch = regexp.MustCompile(`"collection":\s*"([^"]+)"`).FindStringSubmatch(content)
-	if len(collectionIDMatch) > 1 {
-		// Found collection from features
-		return collectionIDMatch[1]
-	}
-	
-	// Look for collection property in nested structures
-	// This handles when the collection ID is in a feature inside a features array
-	if strings.Contains(content, "\"features\"") && strings.Contains(content, "\"collection\"") {
-		// This is likely a FeatureCollection, try to extract collection from the first feature
-		featureMatch := regexp.MustCompile(`"features"\s*:\s*\[\s*\{[^\}]*"collection"\s*:\s*"([^"]+)"`).FindStringSubmatch(content)
-		if len(featureMatch) > 1 {
-			return featureMatch[1]
-		}
-	}
-	
-	// If the above strategies didn't work, try alternative approaches
-	
-	// Try to match common collection patterns from item IDs
-	// Handle Sentinel-2 items (e.g., S2C_MSIL2A_20250408T184941_R113_T10SEH_20250409T000215 -> sentinel-2-l2a)
-	if strings.Contains(content, "\"id\"") {
-		idMatch := regexp.MustCompile(`"id":\s*"([^"]+)"`).FindStringSubmatch(content)
-		if len(idMatch) > 1 {
-			itemID := idMatch[1]
-			if strings.HasPrefix(itemID, "S2") {
-				return "sentinel-2-l2a"
-			} else if strings.HasPrefix(itemID, "LC08") || strings.HasPrefix(itemID, "LC09") {
-				return "landsat-c2-l2"
-			} else if strings.HasPrefix(itemID, "naip") {
-				return "naip"
-			}
-		}
-	}
-	
-	// Try to find collection ID from assets with blob URLs
-	blobMatches := regexp.MustCompile(`https://([^\.]+)\.blob\.core\.windows\.net/([^/]+)/`).FindStringSubmatch(content)
-	if len(blobMatches) > 2 {
-		// The blob storage account name is typically related to the collection
-		storageAccount := blobMatches[1]
-		containerName := blobMatches[2]
-		
-		// Some known mappings based on Microsoft Planetary Computer patterns
-		if storageAccount == "noaacdr" {
-			return "noaa-cdr-" + containerName
-		} else if storageAccount == "sentinel2l2a" {
-			return "sentinel-2-l2a"
-		} else if storageAccount == "landsateuwest" {
-			return "landsat-c2-l2"
-		}
-		
-		// If no specific mapping, return the container name as a fallback
-		return containerName
-	}
-	
-	// Fallback
-	return ""
-}
-
 func signBlobURLs(content, token string) string {
-	// Better regex to detect blob URLs with collection names
-	blobURLRegex := regexp.MustCompile(`https://([^\.]+)\.blob\.core\.windows\.net/([^/]+)/([^"?\s]+)`)
-	
+	// Simple regex to detect all blob URLs that don't already have query parameters
+	blobURLRegex := regexp.MustCompile(`https://[^\.]+\.blob\.core\.windows\.net/[^"'\s?]+`)
+
 	// Find all matches in the content
-	matches := blobURLRegex.FindAllStringSubmatch(content, -1)
+	matches := blobURLRegex.FindAllString(content, -1)
 	if len(matches) == 0 {
 		return content
 	}
-	
+
 	modifiedContent := content
 	signedCount := 0
-	
-	for _, match := range matches {
-		if len(match) < 4 {
-			continue // Skip if regex match is incomplete
-		}
-		
-		originalURL := match[0]
-		
-		// Skip URLs that already have a signature
+
+	for _, originalURL := range matches {
+		// Skip URLs that already have a signature (containing '?')
 		if strings.Contains(originalURL, "?") {
 			continue
 		}
 		
-		// Important: The token is already a full SAS token with query parameters
-		// We need to make sure it's correctly applied as a query string
-		// First, check if token already starts with '?'
-		signedURL := originalURL
-		if strings.HasPrefix(token, "?") {
-			signedURL = originalURL + token
-		} else {
-			signedURL = originalURL + "?" + token
+		// Skip specific storage accounts that don't need signing or have different auth
+		if strings.Contains(originalURL, "ai4edatasetspublicassets.blob.core.windows.net") {
+			log.Printf("Skipping token signing for public assets URL: %s", originalURL)
+			continue
 		}
-		
-		// Replace in content, being careful to only replace when it's a complete URL
-		// This uses special indicators to ensure we're replacing complete URLs in JSON
+
+		// Add the token to the URL
+		signedURL := originalURL + "?" + token
+
+		// Replace in content, being careful with various JSON formats
 		modifiedContent = strings.Replace(
 			modifiedContent,
 			fmt.Sprintf("\"href\":\"%s\"", originalURL),
 			fmt.Sprintf("\"href\":\"%s\"", signedURL),
 			-1,
 		)
-		
-		// Also handle cases where URL appears in assets with a different format
+
 		modifiedContent = strings.Replace(
 			modifiedContent,
 			fmt.Sprintf("\"url\":\"%s\"", originalURL),
 			fmt.Sprintf("\"url\":\"%s\"", signedURL),
 			-1,
 		)
-		
+
 		signedCount++
 	}
-	
+
 	log.Printf("Signed %d blob URLs", signedCount)
 	return modifiedContent
+}
+
+func findCollectionInResponse(content string) string {
+	// Try parsing as JSON first to get the collection ID
+	var stacDoc map[string]interface{}
+	if err := json.Unmarshal([]byte(content), &stacDoc); err == nil {
+		// Check for direct collection property
+		if collID, ok := stacDoc["collection"].(string); ok && collID != "" {
+			return collID
+		}
+
+		// Check if this is a collection itself with an ID
+		if collID, ok := stacDoc["id"].(string); ok && collID != "" {
+			return collID
+		}
+
+		// Check in features array if this is a FeatureCollection
+		if features, ok := stacDoc["features"].([]interface{}); ok && len(features) > 0 {
+			if feature, ok := features[0].(map[string]interface{}); ok {
+				if collID, ok := feature["collection"].(string); ok && collID != "" {
+					return collID
+				}
+			}
+		}
+	}
+
+	// If we couldn't parse JSON or couldn't find collection ID in JSON, try regex
+	matches := collectionPathRegex.FindStringSubmatch(content)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+
+	// If we still don't have a collection ID, use a default
+	// This is a simple failsafe - the blob URLs will still get signed regardless
+	return "default-collection"
 }
 
 func extractCollection(path string) string {
@@ -633,9 +554,9 @@ func isRetryableError(err error) bool {
 	}
 
 	if strings.Contains(err.Error(), "timeout") ||
-	   strings.Contains(err.Error(), "connection refused") ||
-	   strings.Contains(err.Error(), "no such host") ||
-	   strings.Contains(err.Error(), "network") {
+		strings.Contains(err.Error(), "connection refused") ||
+		strings.Contains(err.Error(), "no such host") ||
+		strings.Contains(err.Error(), "network") {
 		return true
 	}
 
@@ -667,13 +588,11 @@ func fetchToken(collection string) (TokenResponse, error) {
 	}
 	defer resp.Body.Close()
 
-	// Debug token fetch response status
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return TokenResponse{}, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
 	}
 
-	// Parse the token response
 	var tokenResp struct {
 		Token        string    `json:"token"`
 		ExpiryString string    `json:"msft:expiry"`
@@ -684,15 +603,12 @@ func fetchToken(collection string) (TokenResponse, error) {
 		return TokenResponse{}, fmt.Errorf("decoding token response: %w", err)
 	}
 
-	// Parse the expiry time
 	parsedExpiry, err := time.Parse(time.RFC3339, tokenResp.ExpiryString)
 	if err != nil {
-		// Fallback to a future time if parsing fails
 		parsedExpiry = time.Now().Add(1 * time.Hour)
 		log.Printf("Warning: Could not parse token expiry time %q: %v. Using default expiration.", tokenResp.ExpiryString, err)
 	}
 
-	// Debug successful token fetch
 	log.Printf("Token obtained for %s (expires: %s)", collection, parsedExpiry.Format(time.RFC3339))
 
 	return TokenResponse{
@@ -704,22 +620,24 @@ func fetchToken(collection string) (TokenResponse, error) {
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin == "" {
-			origin = "*"
+
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		} else {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
 		}
-		
-		w.Header().Set("Access-Control-Allow-Origin", origin)
+
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH")
-		w.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Requested-With, X-API-Key, Cache-Control, X-Requested-With")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Requested-With, X-API-Key, Cache-Control")
 		w.Header().Set("Access-Control-Max-Age", "3600")
 		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Type, Cache-Control")
-		
+
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		
+
 		next(w, r)
 	}
 }
