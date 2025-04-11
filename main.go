@@ -171,13 +171,11 @@ func main() {
 	config = loadConfig()
 
 	stacAPIURL := fmt.Sprintf("http://localhost:%d/api/stac/v1", config.ProxyPort)
-	collectionsURL := fmt.Sprintf("%s/collections", stacAPIURL)
 	targetStacAPI := fmt.Sprintf("%s/api/stac/v1", config.TargetBaseURL)
 
 	log.Printf("##############################################################")
 	log.Printf("# Microsoft STAC Proxy Service Started                       #")
 	log.Printf("# STAC API URL: %-43s #", stacAPIURL)
-	log.Printf("# Collections URL: %-39s #", collectionsURL)
 	log.Printf("# GitHub Repository: %-38s #", "https://github.com/Youssef-Harby/ms-stac-proxy")
 	log.Printf("# Target API: %-45s #", targetStacAPI)
 	log.Printf("# Token cache file: %-39s #", config.TokenCacheFile)
