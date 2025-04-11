@@ -67,6 +67,33 @@ By default, the proxy runs on port 8080 and provides a clear dashboard-style sta
 - The target Microsoft Planetary Computer API endpoint
 - Token cache file location
 
+### Using Docker
+
+You can also run the proxy using Docker:
+
+```bash
+# Pull the image from GitHub Container Registry
+docker pull ghcr.io/youssef-harby/ms-stac-proxy:latest
+
+# Run the container
+docker run -p 8080:8080 ghcr.io/youssef-harby/ms-stac-proxy:latest
+
+# Or specify a custom port
+docker run -p 8081:8080 ghcr.io/youssef-harby/ms-stac-proxy:latest
+```
+
+If you want to build the Docker image locally:
+
+```bash
+# Build the image
+docker build -t ms-stac-proxy .
+
+# Run the container
+docker run -p 8080:8080 ms-stac-proxy
+```
+
+The Docker image includes all the fixes for CORS handling and token issues, ensuring proper URL signing for all supported collections.
+
 ### Using Prebuilt Binaries
 
 You can download prebuilt binaries for your operating system from the [GitHub Releases page](https://github.com/Youssef-Harby/ms-stac-proxy/releases).
