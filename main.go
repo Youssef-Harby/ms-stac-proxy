@@ -163,7 +163,6 @@ func main() {
 	log.Printf("Starting STAC Proxy on port %d", config.ProxyPort)
 	log.Printf("Target API: %s", config.TargetBaseURL)
 	log.Printf("Token cache file: %s", config.TokenCacheFile)
-	log.Printf("Request timeout: %v", config.Timeout)
 
 	loadTokenCache()
 
@@ -177,13 +176,15 @@ func main() {
 	mux.HandleFunc("/", corsMiddleware(handleProxyRequest))
 
 	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", config.ProxyPort),
+		Addr:              fmt.Sprintf("0.0.0.0:%d", config.ProxyPort),
 		Handler:           mux,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+
+	log.Printf("Server bound to all interfaces (0.0.0.0) on port %d", config.ProxyPort)
 
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -386,8 +387,26 @@ func transformSTACResponse(resp *http.Response, collectionID string, hostHeader 
 		}
 	}
 
-	// Use the host from the request instead of hardcoding localhost
-	proxyBaseURL := fmt.Sprintf("http://%s", hostHeader)
+	// Detect protocol from forwarded headers or default to http
+	scheme := "http"
+	
+	// Check for common forwarded protocol headers
+	forwardedProto := resp.Request.Header.Get("X-Forwarded-Proto")
+	if forwardedProto != "" {
+		scheme = forwardedProto
+	}
+	
+	// Alternative header sometimes used
+	forwardedScheme := resp.Request.Header.Get("X-Forwarded-Scheme") 
+	if forwardedScheme != "" {
+		scheme = forwardedScheme
+	}
+	
+	// If Host contains a port, keep it in the URL
+	host := hostHeader
+	
+	// Use the host and detected protocol from the request
+	proxyBaseURL := fmt.Sprintf("%s://%s", scheme, host)
 	log.Printf("Using request host for URL replacement: %s", proxyBaseURL)
 	bodyStr = strings.ReplaceAll(bodyStr, config.TargetBaseURL, proxyBaseURL)
 
@@ -572,25 +591,36 @@ func fetchToken(collection string) (TokenResponse, error) {
 
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-
-		if origin != "" {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
-		} else {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-		}
-
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH")
-		w.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization, X-Requested-With, X-API-Key, Cache-Control")
-		w.Header().Set("Access-Control-Max-Age", "3600")
-		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Type, Cache-Control")
-
+		// Allow requests from any origin
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		
+		// Allow all headers and methods
+		w.Header().Set("Access-Control-Allow-Methods", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		
+		// Maximum permissive age
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		
+		// Expose all headers 
+		w.Header().Set("Access-Control-Expose-Headers", "*")
+		
+		// For mixed content handling - extremely permissive
+		w.Header().Set("Cross-Origin-Embedder-Policy", "unsafe-none")
+		w.Header().Set("Cross-Origin-Opener-Policy", "unsafe-none")
+		w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
+		
+		// To bypass mixed content restrictions
+		w.Header().Set("Content-Security-Policy", "upgrade-insecure-requests")
+		
+		// For iframe embedding
+		w.Header().Set("X-Frame-Options", "ALLOWALL")
+		
+		// Handle preflight requests
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-
+		
 		next(w, r)
 	}
 }
