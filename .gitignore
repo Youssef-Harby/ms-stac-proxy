@@ -31,3 +31,4 @@ go.work
 ehthumbs.db
 Thumbs.db
 build/
+.env

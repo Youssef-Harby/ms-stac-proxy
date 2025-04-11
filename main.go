@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -38,6 +39,7 @@ const (
 	defaultProxyPort      = 8080
 	defaultTargetBaseURL  = "https://planetarycomputer.microsoft.com"
 	defaultTokenEndpoint  = "https://planetarycomputer.microsoft.com/api/sas/v1/token"
+	defaultTokenCacheDir  = "./cache"
 	defaultTokenCacheFile = "token_cache.json"
 	defaultTimeout        = 60 * time.Second
 	defaultSavePeriod     = 5 * time.Minute
@@ -72,6 +74,7 @@ type Config struct {
 	ProxyPort      int
 	TargetBaseURL  string
 	TokenEndpoint  string
+	TokenCacheDir  string
 	TokenCacheFile string
 	Timeout        time.Duration
 	SavePeriod     time.Duration
@@ -102,14 +105,14 @@ type TokenCache struct {
 
 // Application encapsulates global state
 type Application struct {
-	config              Config
-	tokenCache          TokenCache
-	httpClient          *http.Client
-	collectionRegex     *regexp.Regexp
-	blobURLRegex        *regexp.Regexp
-	tokenParamsRegex    *regexp.Regexp
-	shutdownCh          chan struct{}
-	cacheSaverDone      chan struct{}
+	config                Config
+	tokenCache            TokenCache
+	httpClient            *http.Client
+	collectionRegex       *regexp.Regexp
+	blobURLRegex          *regexp.Regexp
+	tokenParamsRegex      *regexp.Regexp
+	shutdownCh            chan struct{}
+	cacheSaverDone        chan struct{}
 	directSignCollections map[string]bool // Collections that need direct signing
 }
 
@@ -130,18 +133,18 @@ func NewApplication() *Application {
 				ForceAttemptHTTP2:   true,  // Attempt HTTP/2
 			},
 		},
-		collectionRegex:     regexp.MustCompile(`/collections/([^/?#]+)`),
-		blobURLRegex:        regexp.MustCompile(`https://([^\.]+)\.blob\.core\.windows\.net/([^/]+)/([^"?\s]+)`),
-		tokenParamsRegex:    regexp.MustCompile(`[?&](st|se|sp|sv|sr|skoid|sktid|skt|ske|sks|skv|sig)=`),
-		shutdownCh:          make(chan struct{}),
-		cacheSaverDone:      make(chan struct{}),
+		collectionRegex:  regexp.MustCompile(`/collections/([^/?#]+)`),
+		blobURLRegex:     regexp.MustCompile(`https://([^\.]+)\.blob\.core\.windows\.net/([^/]+)/([^"?\s]+)`),
+		tokenParamsRegex: regexp.MustCompile(`[?&](st|se|sp|sv|sr|skoid|sktid|skt|ske|sks|skv|sig)=`),
+		shutdownCh:       make(chan struct{}),
+		cacheSaverDone:   make(chan struct{}),
 		directSignCollections: map[string]bool{
-			"gnatsgo": true,
-			"soils": true,
-			"gnatsgo-rasters": true,
+			"gnatsgo":                     true,
+			"soils":                       true,
+			"gnatsgo-rasters":             true,
 			"noaa-cdr-ocean-heat-content": true,
-			"cop-dem-glo-90": true,
-			"cop-dem-glo-30": true,
+			"cop-dem-glo-90":              true,
+			"cop-dem-glo-30":              true,
 			// Add other collections that need direct signing here
 		},
 	}
@@ -164,6 +167,7 @@ func (app *Application) loadConfig() Config {
 		ProxyPort:      defaultProxyPort,
 		TargetBaseURL:  defaultTargetBaseURL,
 		TokenEndpoint:  defaultTokenEndpoint,
+		TokenCacheDir:  defaultTokenCacheDir,
 		TokenCacheFile: defaultTokenCacheFile,
 		Timeout:        defaultTimeout,
 		SavePeriod:     defaultSavePeriod,
@@ -186,6 +190,10 @@ func (app *Application) loadConfig() Config {
 
 	if endpoint := os.Getenv("TOKEN_ENDPOINT"); endpoint != "" {
 		cfg.TokenEndpoint = endpoint
+	}
+
+	if cacheDir := os.Getenv("TOKEN_CACHE_DIR"); cacheDir != "" {
+		cfg.TokenCacheDir = cacheDir
 	}
 
 	if cacheFile := os.Getenv("TOKEN_CACHE_FILE"); cacheFile != "" {
@@ -234,6 +242,7 @@ func (app *Application) Run() {
 	log.Printf("# STAC API URL: %-43s #", stacAPIURL)
 	log.Printf("# GitHub Repository: %-38s #", "https://github.com/Youssef-Harby/ms-stac-proxy")
 	log.Printf("# Target API: %-45s #", targetStacAPI)
+	log.Printf("# Token cache directory: %-39s #", app.config.TokenCacheDir)
 	log.Printf("# Token cache file: %-39s #", app.config.TokenCacheFile)
 	log.Printf("##############################################################")
 
@@ -737,15 +746,22 @@ func (app *Application) loadTokenCache() {
 	app.tokenCache.mu.Lock()
 	defer app.tokenCache.mu.Unlock()
 
-	file, err := os.Open(app.config.TokenCacheFile)
+	// Ensure the token cache directory exists
+	if err := os.MkdirAll(app.config.TokenCacheDir, 0755); err != nil {
+		log.Printf("Failed to create token cache directory: %v", err)
+		return
+	}
+
+	fullPath := filepath.Join(app.config.TokenCacheDir, app.config.TokenCacheFile)
+	data, err := os.ReadFile(fullPath)
 	if os.IsNotExist(err) {
 		log.Printf("Token cache file does not exist, starting with empty cache")
 		return
-	} else if err != nil {
-		log.Printf("Error opening token cache file: %v", err)
+	}
+	if err != nil {
+		log.Printf("Error loading token cache: %v", err)
 		return
 	}
-	defer file.Close()
 
 	// Define structure for deserialization
 	type savedToken struct {
@@ -760,7 +776,7 @@ func (app *Application) loadTokenCache() {
 	}
 
 	var saveData tokenCacheFile
-	if err := json.NewDecoder(file).Decode(&saveData); err != nil {
+	if err := json.Unmarshal(data, &saveData); err != nil {
 		log.Printf("Error decoding token cache file: %v", err)
 		return
 	}
@@ -781,11 +797,11 @@ func (app *Application) loadTokenCache() {
 			expiredCount++
 		}
 	}
-	
+
 	// Process direct tokens
 	directValidCount := 0
 	directExpiredCount := 0
-	
+
 	for collection, token := range saveData.DirectTokens {
 		if now.Before(token.Expiry) {
 			app.tokenCache.directTokens[collection] = DirectSignToken{
@@ -806,78 +822,46 @@ func (app *Application) saveTokenCache() error {
 	app.tokenCache.mu.Lock()
 	defer app.tokenCache.mu.Unlock()
 
-	if !app.tokenCache.dirty {
+	// If the cache is not dirty, no need to save
+	if !app.tokenCache.dirty && time.Since(app.tokenCache.lastSaveTime) < app.config.SavePeriod/2 {
 		return nil
 	}
 
-	// Filter out expired tokens before saving
-	now := time.Now()
-	validTokens := make(map[string]TokenResponse)
-	for collection, token := range app.tokenCache.tokens {
-		if now.Before(token.Expiry) {
-			validTokens[collection] = token
-		}
-	}
-	
-	// Also filter expired direct tokens
-	validDirectTokens := make(map[string]DirectSignToken)
-	for collection, token := range app.tokenCache.directTokens {
-		if now.Before(token.Expiry) {
-			validDirectTokens[collection] = token
-		}
+	// Ensure the token cache directory exists
+	if err := os.MkdirAll(app.config.TokenCacheDir, 0755); err != nil {
+		return fmt.Errorf("failed to create token cache directory: %w", err)
 	}
 
-	// Create a serializable structure for tokens
-	type savedToken struct {
-		Token  string    `json:"token"`
-		Expiry time.Time `json:"expiry"`
+	// Marshal the tokens to JSON
+	cacheData := struct {
+		Tokens       map[string]TokenResponse   `json:"tokens"`
+		DirectTokens map[string]DirectSignToken `json:"direct_tokens"`
+	}{
+		Tokens:       app.tokenCache.tokens,
+		DirectTokens: app.tokenCache.directTokens,
 	}
 
-	type tokenCacheFile struct {
-		Tokens       map[string]savedToken `json:"tokens"`
-		DirectTokens map[string]savedToken `json:"direct_tokens"`
-		SaveTime     time.Time             `json:"save_time"`
-	}
-
-	saveData := tokenCacheFile{
-		Tokens:       make(map[string]savedToken),
-		DirectTokens: make(map[string]savedToken),
-		SaveTime:     time.Now(),
-	}
-
-	for collection, token := range validTokens {
-		saveData.Tokens[collection] = savedToken{
-			Token:  token.Token,
-			Expiry: token.Expiry,
-		}
-	}
-	
-	for collection, token := range validDirectTokens {
-		saveData.DirectTokens[collection] = savedToken{
-			Token:  token.Token,
-			Expiry: token.Expiry,
-		}
-	}
-
-	fileData, err := json.MarshalIndent(saveData, "", "  ")
+	data, err := json.MarshalIndent(cacheData, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshaling token cache: %w", err)
+		return fmt.Errorf("error marshaling token cache: %w", err)
 	}
 
-	file, err := os.OpenFile(app.config.TokenCacheFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return fmt.Errorf("opening token cache file: %w", err)
-	}
-	defer file.Close()
+	// Write to temp file first, then rename for atomic updates
+	fullPath := filepath.Join(app.config.TokenCacheDir, app.config.TokenCacheFile)
+	tempFile := fullPath + ".tmp"
 
-	if _, err := file.Write(fileData); err != nil {
+	if err := os.WriteFile(tempFile, data, 0600); err != nil {
 		return fmt.Errorf("writing token cache file: %w", err)
+	}
+
+	if err := os.Rename(tempFile, fullPath); err != nil {
+		return fmt.Errorf("renaming token cache file: %w", err)
 	}
 
 	app.tokenCache.lastSaveTime = time.Now()
 	app.tokenCache.dirty = false
 
-	log.Printf("Saved %d tokens to disk", len(validTokens) + len(validDirectTokens))
+	log.Printf("Saved %d tokens to disk", len(app.tokenCache.tokens)+len(app.tokenCache.directTokens))
 	return nil
 }
 
@@ -888,19 +872,19 @@ func (app *Application) extractTokenFromSignedURL(signedURL string) (string, tim
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("parsing signed URL: %w", err)
 	}
-	
+
 	// Get the query parameters
 	query := parsedURL.Query()
-	
+
 	// Check if this URL has the required SAS token parameters
 	hasSignature := query.Get("sig") != ""
 	hasStartTime := query.Get("st") != ""
 	hasEndTime := query.Get("se") != ""
-	
+
 	if !hasSignature || !hasStartTime || !hasEndTime {
 		return "", time.Time{}, fmt.Errorf("URL does not contain required SAS token parameters")
 	}
-	
+
 	// Extract expiry time
 	expiryStr := query.Get("se")
 	expiry, err := time.Parse(time.RFC3339, expiryStr)
@@ -911,10 +895,10 @@ func (app *Application) extractTokenFromSignedURL(signedURL string) (string, tim
 			return "", time.Time{}, fmt.Errorf("parsing token expiry time: %w", err)
 		}
 	}
-	
+
 	// Remove the path and hostname part to get just the query string
 	tokenPart := parsedURL.RawQuery
-	
+
 	return tokenPart, expiry, nil
 }
 
@@ -930,29 +914,29 @@ func (app *Application) getDirectSignTokenCached(collection string, assetURL str
 	app.tokenCache.mu.RUnlock()
 
 	now := time.Now()
-	
+
 	// If we have a valid cached token that's not about to expire, use it
 	if exists && now.Add(tokenExpiryBuffer*time.Second).Before(cachedToken.Expiry) {
-		log.Printf("Using cached direct-sign token for %s (expires in %v)", 
+		log.Printf("Using cached direct-sign token for %s (expires in %v)",
 			collection, cachedToken.Expiry.Sub(now).Round(time.Second))
 		return cachedToken.Token, nil
 	}
-	
+
 	// Otherwise, we need to fetch a new token by directly signing one asset
 	log.Printf("Directly signing one asset to extract token for collection: %s", collection)
-	
+
 	// Directly sign one asset URL
 	signedURL, err := app.SignDirectURL(assetURL)
 	if err != nil {
 		return "", fmt.Errorf("direct signing for token extraction: %w", err)
 	}
-	
+
 	// Extract the token from the signed URL
 	token, expiry, err := app.extractTokenFromSignedURL(signedURL)
 	if err != nil {
 		return "", fmt.Errorf("extracting token from signed URL: %w", err)
 	}
-	
+
 	// Cache the token
 	app.tokenCache.mu.Lock()
 	app.tokenCache.directTokens[collection] = DirectSignToken{
@@ -961,10 +945,10 @@ func (app *Application) getDirectSignTokenCached(collection string, assetURL str
 	}
 	app.tokenCache.dirty = true
 	app.tokenCache.mu.Unlock()
-	
-	log.Printf("Cached new direct-sign token for %s (expires: %s)", 
+
+	log.Printf("Cached new direct-sign token for %s (expires: %s)",
 		collection, expiry.Format(time.RFC3339))
-	
+
 	return token, nil
 }
 
@@ -979,7 +963,7 @@ func (app *Application) signBlobURLs(content, token string, collection string) s
 	modifiedContent := content
 	signedCount := 0
 	needsDirectSigning := app.directSignCollections[collection]
-	
+
 	var directSignToken string
 	foundFirstAsset := false
 
@@ -1059,49 +1043,49 @@ func (app *Application) SignDirectURL(blobURL string) (string, error) {
 	if app.isURLSigned(blobURL) {
 		return blobURL, nil
 	}
-	
+
 	// Skip specific storage accounts that don't need signing
 	if strings.Contains(blobURL, "ai4edatasetspublicassets.blob.core.windows.net") {
 		return blobURL, nil
 	}
-	
+
 	// Construct direct signing URL
 	signURL := fmt.Sprintf(directSignEndpoint, app.config.TargetBaseURL, blobURL)
-	
+
 	// Create request
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, signURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("creating direct signing request: %w", err)
 	}
-	
+
 	req.Header.Set(headerUserAgent, "STACProxy/1.0")
 	req.Header.Set(headerAccept, "application/json")
-	
+
 	// Send request
 	resp, err := app.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("sending direct signing request: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("unexpected status code from signing endpoint: %d, body: %s", resp.StatusCode, string(body))
 	}
-	
+
 	// Parse response
 	var signedLink struct {
 		HREF   string    `json:"href"`
 		Expiry time.Time `json:"msft:expiry"`
 	}
-	
+
 	if err := json.NewDecoder(resp.Body).Decode(&signedLink); err != nil {
 		return "", fmt.Errorf("decoding direct signing response: %w", err)
 	}
-	
+
 	log.Printf("Directly signed URL (expires: %s)", signedLink.Expiry.Format(time.RFC3339))
 	return signedLink.HREF, nil
 }
@@ -1114,26 +1098,26 @@ func (app *Application) DetectAndSignSTACItem(content string, collection string)
 		// Not valid JSON, return as is
 		return content, nil
 	}
-	
+
 	// Check if this is a STAC Item
 	if t, ok := data["type"].(string); ok && t == "Feature" {
 		if _, hasProps := data["properties"]; hasProps {
 			if assets, hasAssets := data["assets"].(map[string]interface{}); hasAssets {
 				// This looks like a STAC Item
-				
+
 				// Check if this collection needs direct signing
 				needsDirectSigning := app.directSignCollections[collection]
-				
+
 				// Get regular collection token (as fallback)
 				token, err := app.getTokenCached(collection)
 				if err != nil {
 					log.Printf("Error getting token for collection %s: %v", collection, err)
 				}
-				
+
 				var directSignToken string
 				// Not using foundFirstAsset here because we're doing a two-pass approach
 				// for ItemCollections rather than tracking the first asset as we go
-				
+
 				// Sign all asset URLs
 				modified := false
 				for _, assetData := range assets {
@@ -1163,7 +1147,7 @@ func (app *Application) DetectAndSignSTACItem(content string, collection string)
 						}
 					}
 				}
-				
+
 				if modified {
 					// Re-encode the JSON with signed URLs
 					signedJSON, err := json.Marshal(data)
@@ -1176,7 +1160,7 @@ func (app *Application) DetectAndSignSTACItem(content string, collection string)
 			}
 		}
 	}
-	
+
 	// Also check for STAC ItemCollection
 	if t, ok := data["type"].(string); ok && t == "FeatureCollection" {
 		if features, hasFeatures := data["features"].([]interface{}); hasFeatures {
@@ -1185,17 +1169,17 @@ func (app *Application) DetectAndSignSTACItem(content string, collection string)
 			if err != nil {
 				return content, fmt.Errorf("getting token for STAC item collection signing: %w", err)
 			}
-			
+
 			// Check if this collection needs direct signing
 			needsDirectSigning := app.directSignCollections[collection]
-			
+
 			var directSignToken string
 			// Not using foundFirstAsset here because we're doing a two-pass approach
 			// for ItemCollections rather than tracking the first asset as we go
-			
+
 			// Sign assets in all features
 			modified := false
-			
+
 			// First pass: find an asset to use for direct signing if needed
 			firstAssetURL := ""
 			if needsDirectSigning {
@@ -1205,9 +1189,9 @@ func (app *Application) DetectAndSignSTACItem(content string, collection string)
 							for _, assetData := range assets {
 								if asset, ok := assetData.(map[string]interface{}); ok {
 									if href, hasHref := asset["href"].(string); hasHref {
-										if strings.Contains(href, ".blob.core.windows.net") && 
-										   !app.isURLSigned(href) && 
-										   !strings.Contains(href, "ai4edatasetspublicassets.blob.core.windows.net") {
+										if strings.Contains(href, ".blob.core.windows.net") &&
+											!app.isURLSigned(href) &&
+											!strings.Contains(href, "ai4edatasetspublicassets.blob.core.windows.net") {
 											firstAssetURL = href
 											break
 										}
@@ -1223,7 +1207,7 @@ func (app *Application) DetectAndSignSTACItem(content string, collection string)
 						break
 					}
 				}
-				
+
 				// If we found a good asset URL, get a direct token for it
 				if firstAssetURL != "" {
 					var err error
@@ -1234,7 +1218,7 @@ func (app *Application) DetectAndSignSTACItem(content string, collection string)
 					}
 				}
 			}
-			
+
 			// Second pass: apply tokens to all assets
 			for _, featureData := range features {
 				if feature, ok := featureData.(map[string]interface{}); ok {
@@ -1260,7 +1244,7 @@ func (app *Application) DetectAndSignSTACItem(content string, collection string)
 					}
 				}
 			}
-			
+
 			if modified {
 				// Re-encode the JSON with signed URLs
 				signedJSON, err := json.Marshal(data)
@@ -1272,7 +1256,7 @@ func (app *Application) DetectAndSignSTACItem(content string, collection string)
 			}
 		}
 	}
-	
+
 	// Not a recognized STAC structure or no modifications needed
 	return content, nil
 }

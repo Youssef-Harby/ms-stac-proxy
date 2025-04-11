@@ -1,0 +1,23 @@
+services:
+  ms-stac-proxy:
+    image: ghcr.io/youssef-harby/ms-stac-proxy:latest
+    # build: .
+    container_name: ms-stac-proxy
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8080}:${PROXY_PORT:-8080}"
+    volumes:
+      - token-cache:/app/cache
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:${PROXY_PORT:-8080}/api/stac/v1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    environment:
+      - PROXY_PORT=${PROXY_PORT:-8080}
+      - TOKEN_CACHE_DIR=/app/cache
+
+volumes:
+  token-cache:
+    name: ms-stac-proxy-token-cache
