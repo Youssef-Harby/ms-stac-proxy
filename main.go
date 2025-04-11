@@ -1,3 +1,13 @@
+/*
+ * Microsoft STAC Proxy
+ *
+ * Author: Youssef Harby
+ * GitHub: https://github.com/Youssef-Harby/ms-stac-proxy
+ *
+ * A proxy server for Microsoft Planetary Computer STAC API with token handling
+ * and CORS support for simplified client-side access to geospatial data.
+ */
+
 package main
 
 import (
@@ -160,9 +170,18 @@ func loadConfig() Config {
 func main() {
 	config = loadConfig()
 
-	log.Printf("Starting STAC Proxy on port %d", config.ProxyPort)
-	log.Printf("Target API: %s", config.TargetBaseURL)
-	log.Printf("Token cache file: %s", config.TokenCacheFile)
+	stacAPIURL := fmt.Sprintf("http://localhost:%d/api/stac/v1", config.ProxyPort)
+	collectionsURL := fmt.Sprintf("%s/collections", stacAPIURL)
+	targetStacAPI := fmt.Sprintf("%s/api/stac/v1", config.TargetBaseURL)
+
+	log.Printf("##############################################################")
+	log.Printf("# Microsoft STAC Proxy Service Started                       #")
+	log.Printf("# STAC API URL: %-43s #", stacAPIURL)
+	log.Printf("# Collections URL: %-39s #", collectionsURL)
+	log.Printf("# GitHub Repository: %-38s #", "https://github.com/Youssef-Harby/ms-stac-proxy")
+	log.Printf("# Target API: %-45s #", targetStacAPI)
+	log.Printf("# Token cache file: %-39s #", config.TokenCacheFile)
+	log.Printf("##############################################################")
 
 	loadTokenCache()
 
@@ -389,22 +408,22 @@ func transformSTACResponse(resp *http.Response, collectionID string, hostHeader 
 
 	// Detect protocol from forwarded headers or default to http
 	scheme := "http"
-	
+
 	// Check for common forwarded protocol headers
 	forwardedProto := resp.Request.Header.Get("X-Forwarded-Proto")
 	if forwardedProto != "" {
 		scheme = forwardedProto
 	}
-	
+
 	// Alternative header sometimes used
-	forwardedScheme := resp.Request.Header.Get("X-Forwarded-Scheme") 
+	forwardedScheme := resp.Request.Header.Get("X-Forwarded-Scheme")
 	if forwardedScheme != "" {
 		scheme = forwardedScheme
 	}
-	
+
 	// If Host contains a port, keep it in the URL
 	host := hostHeader
-	
+
 	// Use the host and detected protocol from the request
 	proxyBaseURL := fmt.Sprintf("%s://%s", scheme, host)
 	log.Printf("Using request host for URL replacement: %s", proxyBaseURL)
@@ -593,34 +612,34 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Allow requests from any origin
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		
+
 		// Allow all headers and methods
 		w.Header().Set("Access-Control-Allow-Methods", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "*")
-		
+
 		// Maximum permissive age
 		w.Header().Set("Access-Control-Max-Age", "86400")
-		
-		// Expose all headers 
+
+		// Expose all headers
 		w.Header().Set("Access-Control-Expose-Headers", "*")
-		
+
 		// For mixed content handling - extremely permissive
 		w.Header().Set("Cross-Origin-Embedder-Policy", "unsafe-none")
 		w.Header().Set("Cross-Origin-Opener-Policy", "unsafe-none")
 		w.Header().Set("Cross-Origin-Resource-Policy", "cross-origin")
-		
+
 		// To bypass mixed content restrictions
 		w.Header().Set("Content-Security-Policy", "upgrade-insecure-requests")
-		
+
 		// For iframe embedding
 		w.Header().Set("X-Frame-Options", "ALLOWALL")
-		
+
 		// Handle preflight requests
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		
+
 		next(w, r)
 	}
 }
@@ -729,7 +748,7 @@ func signBlobURLs(content, token string) string {
 		if strings.Contains(originalURL, "?") {
 			continue
 		}
-		
+
 		// Skip specific storage accounts that don't need signing or have different auth
 		if strings.Contains(originalURL, "ai4edatasetspublicassets.blob.core.windows.net") {
 			log.Printf("Skipping token signing for public assets URL: %s", originalURL)
