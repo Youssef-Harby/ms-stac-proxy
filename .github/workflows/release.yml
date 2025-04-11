@@ -1,0 +1,75 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: 'stable'
+          
+      - name: Get dependencies
+        run: go mod tidy
+        
+      - name: Build binaries
+        run: |
+          mkdir -p build
+          
+          # macOS (darwin)
+          echo "Building for macOS (x86_64)..."
+          GOOS=darwin GOARCH=amd64 go build -o build/ms-stac-proxy-darwin-amd64 main.go
+          
+          echo "Building for macOS (arm64)..."
+          GOOS=darwin GOARCH=arm64 go build -o build/ms-stac-proxy-darwin-arm64 main.go
+          
+          # Linux
+          echo "Building for Linux (x86_64)..."
+          GOOS=linux GOARCH=amd64 go build -o build/ms-stac-proxy-linux-amd64 main.go
+          
+          echo "Building for Linux (arm64)..."
+          GOOS=linux GOARCH=arm64 go build -o build/ms-stac-proxy-linux-arm64 main.go
+          
+          # Windows
+          echo "Building for Windows (x86_64)..."
+          GOOS=windows GOARCH=amd64 go build -o build/ms-stac-proxy-windows-amd64.exe main.go
+          
+          echo "Building for Windows (arm64)..."
+          GOOS=windows GOARCH=arm64 go build -o build/ms-stac-proxy-windows-arm64.exe main.go
+          
+          # Create compressed archives
+          cd build
+          
+          tar -czvf ms-stac-proxy-darwin-amd64.tar.gz ms-stac-proxy-darwin-amd64
+          tar -czvf ms-stac-proxy-darwin-arm64.tar.gz ms-stac-proxy-darwin-arm64
+          tar -czvf ms-stac-proxy-linux-amd64.tar.gz ms-stac-proxy-linux-amd64
+          tar -czvf ms-stac-proxy-linux-arm64.tar.gz ms-stac-proxy-linux-arm64
+          zip ms-stac-proxy-windows-amd64.zip ms-stac-proxy-windows-amd64.exe
+          zip ms-stac-proxy-windows-arm64.zip ms-stac-proxy-windows-arm64.exe
+          
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            build/ms-stac-proxy-darwin-amd64.tar.gz
+            build/ms-stac-proxy-darwin-arm64.tar.gz
+            build/ms-stac-proxy-linux-amd64.tar.gz
+            build/ms-stac-proxy-linux-arm64.tar.gz
+            build/ms-stac-proxy-windows-amd64.zip
+            build/ms-stac-proxy-windows-arm64.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
