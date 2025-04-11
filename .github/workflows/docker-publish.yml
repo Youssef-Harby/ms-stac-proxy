@@ -4,11 +4,6 @@ on:
   push:
     tags:
       - 'v*'
-    branches:
-      - main  # Optional: build images on main branch commits too
-  pull_request:
-    branches:
-      - main  # Optional: build but don't push images for PRs
 
 permissions:
   contents: read
