@@ -27,7 +27,7 @@ const (
 	defaultTargetBaseURL  = "https://planetarycomputer.microsoft.com"
 	defaultTokenEndpoint  = "https://planetarycomputer.microsoft.com/api/sas/v1/token"
 	defaultTokenCacheFile = "token_cache.json"
-	defaultTimeout        = 30 * time.Second
+	defaultTimeout        = 60 * time.Second
 	defaultSavePeriod     = 5 * time.Minute
 	defaultRetryAttempts  = 3
 	defaultRetryDelay     = 500 * time.Millisecond
@@ -163,6 +163,7 @@ func main() {
 	log.Printf("Starting STAC Proxy on port %d", config.ProxyPort)
 	log.Printf("Target API: %s", config.TargetBaseURL)
 	log.Printf("Token cache file: %s", config.TokenCacheFile)
+	log.Printf("Request timeout: %v", config.Timeout)
 
 	loadTokenCache()
 
@@ -249,6 +250,7 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	var err error
 
 	if r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
+		// Read the body contents to determine its size for proper logging
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "Error reading request body", statusInternalServerError)
@@ -256,12 +258,28 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		r.Body.Close()
-
+		
+		log.Printf("Request body size: %d bytes", len(bodyBytes))
+		
 		proxyReq, err = http.NewRequestWithContext(ctx, r.Method, targetURL, bytes.NewReader(bodyBytes))
 		if err != nil {
 			http.Error(w, "Error creating request", statusInternalServerError)
 			log.Printf("Error creating request: %v", err)
 			return
+		}
+		
+		// Make sure content length is set correctly
+		proxyReq.ContentLength = int64(len(bodyBytes))
+		proxyReq.Header.Set(headerContentLength, fmt.Sprintf("%d", len(bodyBytes)))
+		
+		// Ensure content type is properly forwarded for POST requests
+		if contentType := r.Header.Get(headerContentType); contentType != "" {
+			proxyReq.Header.Set(headerContentType, contentType)
+		} else {
+			// Default to application/json for POST requests to search endpoint if not specified
+			if strings.Contains(r.URL.Path, "/search") {
+				proxyReq.Header.Set(headerContentType, "application/json")
+			}
 		}
 	} else {
 		proxyReq, err = http.NewRequestWithContext(ctx, r.Method, targetURL, nil)
@@ -418,6 +436,73 @@ func transformSTACResponse(resp *http.Response, collectionID string) (*http.Resp
 	return &newResp, nil
 }
 
+func findCollectionInResponse(content string) string {
+	// First try to find collection ID through a root level property
+	collectionIDMatch := regexp.MustCompile(`"collection":\s*"([^"]+)"`).FindStringSubmatch(content)
+	if len(collectionIDMatch) > 1 {
+		// Collection ID is explicitly mentioned
+		return collectionIDMatch[1]
+	}
+
+	// Try to find collection ID through the features array
+	collectionIDMatch = regexp.MustCompile(`"collection":\s*"([^"]+)"`).FindStringSubmatch(content)
+	if len(collectionIDMatch) > 1 {
+		// Found collection from features
+		return collectionIDMatch[1]
+	}
+	
+	// Look for collection property in nested structures
+	// This handles when the collection ID is in a feature inside a features array
+	if strings.Contains(content, "\"features\"") && strings.Contains(content, "\"collection\"") {
+		// This is likely a FeatureCollection, try to extract collection from the first feature
+		featureMatch := regexp.MustCompile(`"features"\s*:\s*\[\s*\{[^\}]*"collection"\s*:\s*"([^"]+)"`).FindStringSubmatch(content)
+		if len(featureMatch) > 1 {
+			return featureMatch[1]
+		}
+	}
+	
+	// If the above strategies didn't work, try alternative approaches
+	
+	// Try to match common collection patterns from item IDs
+	// Handle Sentinel-2 items (e.g., S2C_MSIL2A_20250408T184941_R113_T10SEH_20250409T000215 -> sentinel-2-l2a)
+	if strings.Contains(content, "\"id\"") {
+		idMatch := regexp.MustCompile(`"id":\s*"([^"]+)"`).FindStringSubmatch(content)
+		if len(idMatch) > 1 {
+			itemID := idMatch[1]
+			if strings.HasPrefix(itemID, "S2") {
+				return "sentinel-2-l2a"
+			} else if strings.HasPrefix(itemID, "LC08") || strings.HasPrefix(itemID, "LC09") {
+				return "landsat-c2-l2"
+			} else if strings.HasPrefix(itemID, "naip") {
+				return "naip"
+			}
+		}
+	}
+	
+	// Try to find collection ID from assets with blob URLs
+	blobMatches := regexp.MustCompile(`https://([^\.]+)\.blob\.core\.windows\.net/([^/]+)/`).FindStringSubmatch(content)
+	if len(blobMatches) > 2 {
+		// The blob storage account name is typically related to the collection
+		storageAccount := blobMatches[1]
+		containerName := blobMatches[2]
+		
+		// Some known mappings based on Microsoft Planetary Computer patterns
+		if storageAccount == "noaacdr" {
+			return "noaa-cdr-" + containerName
+		} else if storageAccount == "sentinel2l2a" {
+			return "sentinel-2-l2a"
+		} else if storageAccount == "landsateuwest" {
+			return "landsat-c2-l2"
+		}
+		
+		// If no specific mapping, return the container name as a fallback
+		return containerName
+	}
+	
+	// Fallback
+	return ""
+}
+
 func signBlobURLs(content, token string) string {
 	// Better regex to detect blob URLs with collection names
 	blobURLRegex := regexp.MustCompile(`https://([^\.]+)\.blob\.core\.windows\.net/([^/]+)/([^"?\s]+)`)
@@ -475,36 +560,6 @@ func signBlobURLs(content, token string) string {
 	
 	log.Printf("Signed %d blob URLs", signedCount)
 	return modifiedContent
-}
-
-func findCollectionInResponse(content string) string {
-	// First try to find collection ID through a root level property
-	collectionIDMatch := regexp.MustCompile(`"id":\s*"([^"]+)"`).FindStringSubmatch(content)
-	if len(collectionIDMatch) > 1 {
-		// Validate that it looks like a collection ID (no spaces, reasonable length)
-		if len(collectionIDMatch[1]) > 0 && len(collectionIDMatch[1]) < 100 && !strings.Contains(collectionIDMatch[1], " ") {
-			return collectionIDMatch[1]
-		}
-	}
-	
-	// Try to find collection ID from assets with blob URLs
-	blobMatches := regexp.MustCompile(`https://([^\.]+)\.blob\.core\.windows\.net/([^/]+)/`).FindStringSubmatch(content)
-	if len(blobMatches) > 2 {
-		// The blob storage account name is typically related to the collection
-		storageAccount := blobMatches[1]
-		containerName := blobMatches[2]
-		
-		// Some known mappings based on Microsoft Planetary Computer patterns
-		if storageAccount == "noaacdr" {
-			return "noaa-cdr-" + containerName
-		}
-		
-		// If no specific mapping, return the container name as a fallback
-		return containerName
-	}
-	
-	// Fallback
-	return ""
 }
 
 func extractCollection(path string) string {
