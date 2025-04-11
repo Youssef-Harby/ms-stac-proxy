@@ -15,6 +15,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -109,6 +110,11 @@ var (
 )
 
 func loadConfig() Config {
+	// Parse command line flags
+	var portFlag int
+	flag.IntVar(&portFlag, "p", 0, "Set the proxy port (overrides PROXY_PORT environment variable)")
+	flag.Parse()
+
 	cfg := Config{
 		ProxyPort:      defaultProxyPort,
 		TargetBaseURL:  defaultTargetBaseURL,
@@ -120,7 +126,10 @@ func loadConfig() Config {
 		RetryDelay:     defaultRetryDelay,
 	}
 
-	if port := os.Getenv("PROXY_PORT"); port != "" {
+	// Command line flags take precedence over environment variables
+	if portFlag > 0 {
+		cfg.ProxyPort = portFlag
+	} else if port := os.Getenv("PROXY_PORT"); port != "" {
 		if p, err := strconv.Atoi(port); err == nil && p > 0 {
 			cfg.ProxyPort = p
 		}

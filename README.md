@@ -48,10 +48,17 @@ Start the proxy:
 go run main.go
 ```
 
+You can specify a custom port using the `-p` flag:
+
+```bash
+go run main.go -p 8081
+```
+
 Or use the compiled binary after running the setup script:
 
 ```bash
 ./ms-stac-proxy
+./ms-stac-proxy -p 8081  # Custom port
 ```
 
 By default, the proxy runs on port 8080 and provides a clear dashboard-style startup display with information about:
@@ -184,8 +191,12 @@ Tokens are cached in memory and persisted to disk in `token_cache.json`. This al
 
 ## Configuration
 
-The proxy can be configured using environment variables:
+The proxy can be configured using command-line flags or environment variables:
 
+### Command-line flags:
+- `-p <port>`: Set the proxy port (e.g., `-p 8081`)
+
+### Environment variables:
 - `PROXY_PORT`: The port the proxy listens on (default: 8080)
 - `TARGET_BASE_URL`: The base URL of the Microsoft Planetary Computer API (default: https://planetarycomputer.microsoft.com)
 - `TOKEN_ENDPOINT`: The endpoint for fetching SAS tokens (default: https://planetarycomputer.microsoft.com/api/sas/v1/token)
@@ -194,6 +205,8 @@ The proxy can be configured using environment variables:
 - `SAVE_PERIOD`: How often to save tokens to disk (default: 5m)
 - `RETRY_ATTEMPTS`: Number of retry attempts for failed requests (default: 3)
 - `RETRY_DELAY`: Delay between retry attempts (default: 500ms)
+
+Note: Command-line flags take precedence over environment variables.
 
 ## License
 
