@@ -33,6 +33,7 @@ import (
 	"github.com/andybalholm/brotli"
 )
 
+// Constants
 const (
 	defaultProxyPort      = 8080
 	defaultTargetBaseURL  = "https://planetarycomputer.microsoft.com"
@@ -44,6 +45,7 @@ const (
 	defaultRetryDelay     = 500 * time.Millisecond
 )
 
+// HTTP header constants
 const (
 	headerContentType     = "Content-Type"
 	headerContentEncoding = "Content-Encoding"
@@ -55,6 +57,7 @@ const (
 	headerXForwardedHost  = "X-Forwarded-Host"
 )
 
+// HTTP status constants
 const (
 	statusOK                  = http.StatusOK
 	statusBadRequest          = http.StatusBadRequest
@@ -62,6 +65,7 @@ const (
 	statusBadGateway          = http.StatusBadGateway
 )
 
+// Config holds the application configuration
 type Config struct {
 	ProxyPort      int
 	TargetBaseURL  string
@@ -73,11 +77,13 @@ type Config struct {
 	RetryDelay     time.Duration
 }
 
+// TokenResponse represents the token data returned from the API
 type TokenResponse struct {
 	Token  string    `json:"token"`
 	Expiry time.Time `json:"msft:expiry"`
 }
 
+// TokenCache manages token storage and retrieval
 type TokenCache struct {
 	mu           sync.RWMutex
 	tokens       map[string]TokenResponse
@@ -85,31 +91,48 @@ type TokenCache struct {
 	dirty        bool // Indicates if there are unsaved changes
 }
 
-var (
-	config Config
+// Application encapsulates global state
+type Application struct {
+	config            Config
+	tokenCache        TokenCache
+	httpClient        *http.Client
+	collectionRegex   *regexp.Regexp
+	blobURLRegex      *regexp.Regexp
+	shutdownCh        chan struct{}
+	cacheSaverDone    chan struct{}
+}
 
-	tokenCache = TokenCache{
-		tokens:       make(map[string]TokenResponse),
-		lastSaveTime: time.Now(),
-	}
-
-	httpClient = &http.Client{
-		Transport: &http.Transport{
-			MaxIdleConnsPerHost: 100,
-			MaxConnsPerHost:     1000,
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  false, // Allow compression
-			ForceAttemptHTTP2:   true,  // Attempt HTTP/2
+// NewApplication creates and initializes a new application
+func NewApplication() *Application {
+	app := &Application{
+		tokenCache: TokenCache{
+			tokens:       make(map[string]TokenResponse),
+			lastSaveTime: time.Now(),
 		},
+		httpClient: &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost: 100,
+				MaxConnsPerHost:     1000,
+				IdleConnTimeout:     90 * time.Second,
+				DisableCompression:  false, // Allow compression
+				ForceAttemptHTTP2:   true,  // Attempt HTTP/2
+			},
+		},
+		collectionRegex: regexp.MustCompile(`/collections/([^/?#]+)`),
+		blobURLRegex:    regexp.MustCompile(`https://([^\.]+)\.blob\.core\.windows\.net/([^/]+)/([^"?\s]+)`),
+		shutdownCh:      make(chan struct{}),
+		cacheSaverDone:  make(chan struct{}),
 	}
 
-	collectionPathRegex = regexp.MustCompile(`/collections/([^/?#]+)`)
-	blobURLRegex        = regexp.MustCompile(`https://([^\.]+)\.blob\.core\.windows\.net/([^/]+)/([^"?\s]+)`)
+	// Load configuration
+	app.config = app.loadConfig()
+	app.httpClient.Timeout = app.config.Timeout
 
-	shutdownCh = make(chan struct{})
-)
+	return app
+}
 
-func loadConfig() Config {
+// loadConfig loads configuration from environment variables and command line flags
+func (app *Application) loadConfig() Config {
 	// Parse command line flags
 	var portFlag int
 	flag.IntVar(&portFlag, "p", 0, "Set the proxy port (overrides PROXY_PORT environment variable)")
@@ -171,38 +194,39 @@ func loadConfig() Config {
 		}
 	}
 
-	httpClient.Timeout = cfg.Timeout
-
 	return cfg
 }
 
 func main() {
-	config = loadConfig()
+	app := NewApplication()
+	app.Run()
+}
 
-	stacAPIURL := fmt.Sprintf("http://localhost:%d/api/stac/v1", config.ProxyPort)
-	targetStacAPI := fmt.Sprintf("%s/api/stac/v1", config.TargetBaseURL)
+// Run starts the application
+func (app *Application) Run() {
+	stacAPIURL := fmt.Sprintf("http://localhost:%d/api/stac/v1", app.config.ProxyPort)
+	targetStacAPI := fmt.Sprintf("%s/api/stac/v1", app.config.TargetBaseURL)
 
 	log.Printf("##############################################################")
 	log.Printf("# Microsoft STAC Proxy Service Started                       #")
 	log.Printf("# STAC API URL: %-43s #", stacAPIURL)
 	log.Printf("# GitHub Repository: %-38s #", "https://github.com/Youssef-Harby/ms-stac-proxy")
 	log.Printf("# Target API: %-45s #", targetStacAPI)
-	log.Printf("# Token cache file: %-39s #", config.TokenCacheFile)
+	log.Printf("# Token cache file: %-39s #", app.config.TokenCacheFile)
 	log.Printf("##############################################################")
 
-	loadTokenCache()
+	app.loadTokenCache()
 
-	cacheSaverDone := make(chan struct{})
-	go startTokenCacheSaver(cacheSaverDone)
+	go app.startTokenCacheSaver()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", corsMiddleware(handleProxyRequest))
+	mux.HandleFunc("/", app.corsMiddleware(app.handleProxyRequest))
 
 	server := &http.Server{
-		Addr:              fmt.Sprintf("0.0.0.0:%d", config.ProxyPort),
+		Addr:              fmt.Sprintf("0.0.0.0:%d", app.config.ProxyPort),
 		Handler:           mux,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -210,7 +234,7 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	log.Printf("Server bound to all interfaces (0.0.0.0) on port %d", config.ProxyPort)
+	log.Printf("Server bound to all interfaces (0.0.0.0) on port %d", app.config.ProxyPort)
 
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -224,10 +248,10 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	close(shutdownCh)
-	close(cacheSaverDone)
+	close(app.shutdownCh)
+	close(app.cacheSaverDone)
 
-	if err := saveTokenCache(); err != nil {
+	if err := app.saveTokenCache(); err != nil {
 		log.Printf("Error saving token cache during shutdown: %v", err)
 	}
 
@@ -238,39 +262,41 @@ func main() {
 	log.Println("Server gracefully stopped")
 }
 
-func startTokenCacheSaver(done <-chan struct{}) {
-	ticker := time.NewTicker(config.SavePeriod)
+// startTokenCacheSaver periodically saves the token cache to disk
+func (app *Application) startTokenCacheSaver() {
+	ticker := time.NewTicker(app.config.SavePeriod)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if err := saveTokenCache(); err != nil {
+			if err := app.saveTokenCache(); err != nil {
 				log.Printf("Error saving token cache: %v", err)
 			}
-		case <-done:
+		case <-app.cacheSaverDone:
 			log.Println("Token cache saver stopped")
 			return
-		case <-shutdownCh:
+		case <-app.shutdownCh:
 			return
 		}
 	}
 }
 
-func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
+// handleProxyRequest processes incoming HTTP requests
+func (app *Application) handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Received request: %s %s", r.Method, r.URL.Path)
 
-	collection := extractCollection(r.URL.Path)
+	collection := app.extractCollection(r.URL.Path)
 	if collection != "" {
 		log.Printf("Detected collection: %s", collection)
 	}
 
-	targetURL := fmt.Sprintf("%s%s", config.TargetBaseURL, r.URL.Path)
+	targetURL := fmt.Sprintf("%s%s", app.config.TargetBaseURL, r.URL.Path)
 	if r.URL.RawQuery != "" {
 		targetURL = fmt.Sprintf("%s?%s", targetURL, r.URL.RawQuery)
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), config.Timeout)
+	ctx, cancel := context.WithTimeout(r.Context(), app.config.Timeout)
 	defer cancel()
 
 	var proxyReq *http.Request
@@ -312,7 +338,7 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	proxyReq.Header.Set(headerXForwardedFor, r.RemoteAddr)
 	proxyReq.Header.Set(headerXForwardedHost, r.Host)
 
-	resp, err := httpClient.Do(proxyReq)
+	resp, err := app.httpClient.Do(proxyReq)
 	if err != nil {
 		http.Error(w, "Error forwarding request", statusBadGateway)
 		log.Printf("Error forwarding request: %v", err)
@@ -320,8 +346,8 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	if isSTACResponse(resp) {
-		transformedResp, err := transformSTACResponse(resp, collection, r.Host)
+	if app.isSTACResponse(resp) {
+		transformedResp, err := app.transformSTACResponse(resp, collection, r.Host)
 		if err != nil {
 			http.Error(w, "Error transforming response", statusInternalServerError)
 			log.Printf("Error transforming response: %v", err)
@@ -358,7 +384,8 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Successfully proxied request: %s %s -> %d", r.Method, r.URL.Path, resp.StatusCode)
 }
 
-func isSTACResponse(resp *http.Response) bool {
+// isSTACResponse checks if the response is a STAC API JSON response
+func (app *Application) isSTACResponse(resp *http.Response) bool {
 	contentType := resp.Header.Get(headerContentType)
 	return strings.Contains(contentType, "application/json") ||
 		strings.Contains(contentType, "application/geo+json") ||
@@ -366,7 +393,8 @@ func isSTACResponse(resp *http.Response) bool {
 		strings.Contains(contentType, "application/ld+json")
 }
 
-func transformSTACResponse(resp *http.Response, collectionID string, hostHeader string) (*http.Response, error) {
+// transformSTACResponse transforms the STAC API response
+func (app *Application) transformSTACResponse(resp *http.Response, collectionID string, hostHeader string) (*http.Response, error) {
 	contentType := resp.Header.Get(headerContentType)
 	contentEncoding := resp.Header.Get(headerContentEncoding)
 
@@ -397,7 +425,7 @@ func transformSTACResponse(resp *http.Response, collectionID string, hostHeader 
 
 	// If we don't have a collection ID yet, try to extract it from the response
 	if collectionID == "" {
-		collectionID = findCollectionInResponse(bodyStr)
+		collectionID = app.findCollectionInResponse(bodyStr)
 		if collectionID != "" {
 			log.Printf("Using collection '%s' for token fetching", collectionID)
 		}
@@ -405,11 +433,11 @@ func transformSTACResponse(resp *http.Response, collectionID string, hostHeader 
 
 	// Sign all blob URLs regardless of collection
 	if strings.Contains(bodyStr, ".blob.core.windows.net") {
-		token, err := getTokenCached(collectionID)
+		token, err := app.getTokenCached(collectionID)
 		if err != nil {
 			log.Printf("Error getting token for collection %s: %v", collectionID, err)
 		} else {
-			bodyStr = signBlobURLs(bodyStr, token)
+			bodyStr = app.signBlobURLs(bodyStr, token)
 		}
 	}
 
@@ -434,7 +462,7 @@ func transformSTACResponse(resp *http.Response, collectionID string, hostHeader 
 	// Use the host and detected protocol from the request
 	proxyBaseURL := fmt.Sprintf("%s://%s", scheme, host)
 	log.Printf("Using request host for URL replacement: %s", proxyBaseURL)
-	bodyStr = strings.ReplaceAll(bodyStr, config.TargetBaseURL, proxyBaseURL)
+	bodyStr = strings.ReplaceAll(bodyStr, app.config.TargetBaseURL, proxyBaseURL)
 
 	newResp := *resp
 	newResp.Header = resp.Header.Clone()
@@ -446,7 +474,8 @@ func transformSTACResponse(resp *http.Response, collectionID string, hostHeader 
 	return &newResp, nil
 }
 
-func findCollectionInResponse(content string) string {
+// findCollectionInResponse extracts collection ID from a STAC response
+func (app *Application) findCollectionInResponse(content string) string {
 	// Try parsing as JSON first to get the collection ID
 	var stacDoc map[string]interface{}
 	if err := json.Unmarshal([]byte(content), &stacDoc); err == nil {
@@ -471,7 +500,7 @@ func findCollectionInResponse(content string) string {
 	}
 
 	// If we couldn't parse JSON or couldn't find collection ID in JSON, try regex
-	matches := collectionPathRegex.FindStringSubmatch(content)
+	matches := app.collectionRegex.FindStringSubmatch(content)
 	if len(matches) > 1 {
 		return matches[1]
 	}
@@ -481,18 +510,20 @@ func findCollectionInResponse(content string) string {
 	return "default-collection"
 }
 
-func extractCollection(path string) string {
-	collectionMatch := collectionPathRegex.FindStringSubmatch(path)
+// extractCollection extracts collection ID from a request path
+func (app *Application) extractCollection(path string) string {
+	collectionMatch := app.collectionRegex.FindStringSubmatch(path)
 	if len(collectionMatch) > 1 {
 		return collectionMatch[1]
 	}
 	return ""
 }
 
-func getTokenCached(collection string) (string, error) {
-	tokenCache.mu.RLock()
-	cachedToken, exists := tokenCache.tokens[collection]
-	tokenCache.mu.RUnlock()
+// getTokenCached gets a token for a collection, using cache if possible
+func (app *Application) getTokenCached(collection string) (string, error) {
+	app.tokenCache.mu.RLock()
+	cachedToken, exists := app.tokenCache.tokens[collection]
+	app.tokenCache.mu.RUnlock()
 
 	if exists && time.Now().Before(cachedToken.Expiry) {
 		log.Printf("Using cached token for %s (expires in %v)",
@@ -503,25 +534,25 @@ func getTokenCached(collection string) (string, error) {
 	var tokenResp TokenResponse
 	var err error
 
-	for attempt := 0; attempt < config.RetryAttempts; attempt++ {
+	for attempt := 0; attempt < app.config.RetryAttempts; attempt++ {
 		if attempt > 0 {
-			backoff := time.Duration(attempt) * config.RetryDelay
+			backoff := time.Duration(attempt) * app.config.RetryDelay
 			log.Printf("Retrying token fetch for %s (attempt %d/%d) after %v",
-				collection, attempt+1, config.RetryAttempts, backoff)
+				collection, attempt+1, app.config.RetryAttempts, backoff)
 			select {
 			case <-time.After(backoff):
 				// Continue with retry
-			case <-shutdownCh:
+			case <-app.shutdownCh:
 				return "", fmt.Errorf("shutdown in progress")
 			}
 		}
 
-		tokenResp, err = fetchToken(collection)
+		tokenResp, err = app.fetchToken(collection)
 		if err == nil {
 			break
 		}
 
-		if !isRetryableError(err) {
+		if !app.isRetryableError(err) {
 			break
 		}
 	}
@@ -530,23 +561,24 @@ func getTokenCached(collection string) (string, error) {
 		return "", err
 	}
 
-	tokenCache.mu.Lock()
-	tokenCache.tokens[collection] = tokenResp
-	tokenCache.dirty = true
-	tokenCache.mu.Unlock()
+	app.tokenCache.mu.Lock()
+	app.tokenCache.tokens[collection] = tokenResp
+	app.tokenCache.dirty = true
+	app.tokenCache.mu.Unlock()
 
 	go func() {
-		if err := saveTokenCache(); err != nil {
+		if err := app.saveTokenCache(); err != nil {
 			log.Printf("Error saving token cache: %v", err)
 		} else {
-			log.Printf("Saved token cache with %d entries to %s", len(tokenCache.tokens), config.TokenCacheFile)
+			log.Printf("Saved token cache with %d entries to %s", len(app.tokenCache.tokens), app.config.TokenCacheFile)
 		}
 	}()
 
 	return tokenResp.Token, nil
 }
 
-func isRetryableError(err error) bool {
+// isRetryableError determines if an error should trigger a retry
+func (app *Application) isRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -565,8 +597,9 @@ func isRetryableError(err error) bool {
 	return false
 }
 
-func fetchToken(collection string) (TokenResponse, error) {
-	tokenURL := fmt.Sprintf("%s/%s", config.TokenEndpoint, collection)
+// fetchToken fetches a fresh token from the token endpoint
+func (app *Application) fetchToken(collection string) (TokenResponse, error) {
+	tokenURL := fmt.Sprintf("%s/%s", app.config.TokenEndpoint, collection)
 	log.Printf("Fetching fresh token from %s", tokenURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -580,7 +613,7 @@ func fetchToken(collection string) (TokenResponse, error) {
 	req.Header.Set(headerUserAgent, "STACProxy/1.0")
 	req.Header.Set(headerAccept, "application/json")
 
-	resp, err := httpClient.Do(req)
+	resp, err := app.httpClient.Do(req)
 	if err != nil {
 		return TokenResponse{}, fmt.Errorf("sending token request: %w", err)
 	}
@@ -615,7 +648,8 @@ func fetchToken(collection string) (TokenResponse, error) {
 	}, nil
 }
 
-func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+// corsMiddleware adds CORS headers to responses
+func (app *Application) corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Allow requests from any origin
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -651,11 +685,12 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func loadTokenCache() {
-	file, err := os.Open(config.TokenCacheFile)
+// loadTokenCache loads the token cache from disk
+func (app *Application) loadTokenCache() {
+	file, err := os.Open(app.config.TokenCacheFile)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("No token cache file found at %s, will create when tokens are fetched", config.TokenCacheFile)
+			log.Printf("No token cache file found at %s, will create when tokens are fetched", app.config.TokenCacheFile)
 			return
 		}
 		log.Printf("Error opening token cache file: %v", err)
@@ -674,41 +709,42 @@ func loadTokenCache() {
 	validTokens := 0
 	expiredTokens := 0
 
-	tokenCache.mu.Lock()
+	app.tokenCache.mu.Lock()
 	for collection, token := range loadedTokens {
 		if now.Before(token.Expiry) {
-			tokenCache.tokens[collection] = token
+			app.tokenCache.tokens[collection] = token
 			validTokens++
 		} else {
 			expiredTokens++
 		}
 	}
-	tokenCache.mu.Unlock()
+	app.tokenCache.mu.Unlock()
 
 	log.Printf("Loaded %d valid tokens from cache (discarded %d expired)", validTokens, expiredTokens)
 }
 
-func saveTokenCache() error {
-	tokenCache.mu.RLock()
-	if !tokenCache.dirty {
-		tokenCache.mu.RUnlock()
+// saveTokenCache saves the token cache to disk
+func (app *Application) saveTokenCache() error {
+	app.tokenCache.mu.RLock()
+	if !app.tokenCache.dirty {
+		app.tokenCache.mu.RUnlock()
 		return nil
 	}
 
 	tokenCopy := make(map[string]TokenResponse)
-	for k, v := range tokenCache.tokens {
+	for k, v := range app.tokenCache.tokens {
 		tokenCopy[k] = v
 	}
-	tokenCache.mu.RUnlock()
+	app.tokenCache.mu.RUnlock()
 
-	dir := filepath.Dir(config.TokenCacheFile)
+	dir := filepath.Dir(app.config.TokenCacheFile)
 	if dir != "." && dir != "/" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("creating directory for token cache: %w", err)
 		}
 	}
 
-	tempFile := config.TokenCacheFile + ".tmp"
+	tempFile := app.config.TokenCacheFile + ".tmp"
 	file, err := os.Create(tempFile)
 	if err != nil {
 		return fmt.Errorf("creating token cache file: %w", err)
@@ -724,25 +760,23 @@ func saveTokenCache() error {
 		return fmt.Errorf("closing token cache file: %w", err)
 	}
 
-	if err := os.Rename(tempFile, config.TokenCacheFile); err != nil {
+	if err := os.Rename(tempFile, app.config.TokenCacheFile); err != nil {
 		return fmt.Errorf("renaming token cache file: %w", err)
 	}
 
-	tokenCache.mu.Lock()
-	tokenCache.dirty = false
-	tokenCache.lastSaveTime = time.Now()
-	tokenCache.mu.Unlock()
+	app.tokenCache.mu.Lock()
+	app.tokenCache.dirty = false
+	app.tokenCache.lastSaveTime = time.Now()
+	app.tokenCache.mu.Unlock()
 
 	log.Printf("Saved %d tokens to cache file", len(tokenCopy))
 	return nil
 }
 
-func signBlobURLs(content, token string) string {
-	// Simple regex to detect all blob URLs that don't already have query parameters
-	blobURLRegex := regexp.MustCompile(`https://[^\.]+\.blob\.core\.windows\.net/[^"'\s?]+`)
-
+// signBlobURLs adds SAS tokens to Azure blob URLs
+func (app *Application) signBlobURLs(content, token string) string {
 	// Find all matches in the content
-	matches := blobURLRegex.FindAllString(content, -1)
+	matches := app.blobURLRegex.FindAllString(content, -1)
 	if len(matches) == 0 {
 		return content
 	}
