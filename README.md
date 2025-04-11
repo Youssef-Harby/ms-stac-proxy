@@ -54,6 +54,35 @@ Or use the compiled binary after running the setup script:
 
 By default, the proxy runs on port 8080.
 
+### Using Prebuilt Binaries
+
+You can download prebuilt binaries for your operating system from the [GitHub Releases page](https://github.com/Youssef-Harby/ms-stac-proxy/releases).
+
+1. Navigate to the [Releases page](https://github.com/Youssef-Harby/ms-stac-proxy/releases)
+2. Download the appropriate binary for your system:
+   - macOS (Intel): `ms-stac-proxy-darwin-amd64.tar.gz`
+   - macOS (Apple Silicon): `ms-stac-proxy-darwin-arm64.tar.gz`
+   - Linux (x86_64): `ms-stac-proxy-linux-amd64.tar.gz`
+   - Linux (ARM64): `ms-stac-proxy-linux-arm64.tar.gz`
+   - Windows (x86_64): `ms-stac-proxy-windows-amd64.zip`
+   - Windows (ARM64): `ms-stac-proxy-windows-arm64.zip`
+
+#### Note for macOS Users
+
+macOS may block the binary from running due to security restrictions. If you receive a "killed" message when trying to run the binary, use the following command to remove the security attribute:
+
+```bash
+xattr -cr ms-stac-proxy-darwin-arm64
+# or for Intel Macs
+xattr -cr ms-stac-proxy-darwin-amd64
+```
+
+Then you can run the binary normally:
+
+```bash
+./ms-stac-proxy-darwin-arm64
+```
+
 ## Releases
 
 This project uses GitHub Actions to automatically build and release binaries for multiple platforms when a new tag is pushed. The workflow:
