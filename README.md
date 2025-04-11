@@ -54,6 +54,49 @@ Or use the compiled binary after running the setup script:
 
 By default, the proxy runs on port 8080.
 
+## Releases
+
+This project uses GitHub Actions to automatically build and release binaries for multiple platforms when a new tag is pushed. The workflow:
+
+1. Builds binaries for:
+   - macOS (x86_64 and arm64)
+   - Linux (x86_64 and arm64) 
+   - Windows (x86_64 and arm64)
+2. Packages the binaries (tar.gz for macOS/Linux, zip for Windows)
+3. Creates a GitHub release with the binaries attached
+
+### Creating a Release
+
+To create a new release:
+
+```bash
+# Create a tag
+git tag v1.0.0
+
+# Push the tag to GitHub
+git push origin v1.0.0
+```
+
+The GitHub Actions workflow will automatically build and publish the release.
+
+### Deleting and Re-Creating a Release
+
+If you need to delete a tag and re-create it:
+
+```bash
+# Delete the tag locally
+git tag -d v1.0.0
+
+# Delete the tag remotely
+git push --delete origin v1.0.0
+
+# Re-create the tag
+git tag v1.0.0
+
+# Push the new tag
+git push origin v1.0.0
+```
+
 ## Usage
 
 Once the proxy is running, configure your client application to use `http://localhost:8080` as the base URL for the Microsoft Planetary Computer API.
