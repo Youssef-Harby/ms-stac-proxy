@@ -28,7 +28,7 @@ The proxy includes a visual dashboard-style startup display showing key informat
 
 ### Prerequisites
 
-- Go 1.16 or later
+- Go 1.23 or later
 
 ### Installation
 
@@ -82,15 +82,26 @@ docker run -p 8080:8080 ghcr.io/youssef-harby/ms-stac-proxy:latest
 docker run -p 8081:8080 ghcr.io/youssef-harby/ms-stac-proxy:latest
 ```
 
-If you want to build the Docker image locally:
+### Using Docker Compose
 
-```bash
-# Build the image
-docker build -t ms-stac-proxy .
+The easiest way to run the proxy is with Docker Compose:
 
-# Run the container
-docker run -p 8080:8080 ms-stac-proxy
+1. Create a `.env` file with your configuration (see `.env-example`):
 ```
+HOST_PORT=8080        # External port to access the proxy (outside of container)
+PROXY_PORT=8080       # Internal port for the proxy service (inside container)
+```
+
+2. Run with docker-compose:
+```bash
+docker compose up -d
+```
+
+This setup includes:
+- Persistent token cache stored in a named volume
+- Configurable ports through environment variables
+- Health checks to ensure the service is working properly
+- Optional STAC Browser UI (uncomment in docker-compose.yaml)
 
 The Docker image includes all the fixes for CORS handling and token issues, ensuring proper URL signing for all supported collections.
 
@@ -183,6 +194,20 @@ The proxy will automatically:
 3. Sign all Azure blob URLs in the response
 4. Return the processed response to your client
 
+## Environment Variables
+
+The proxy can be configured using the following environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PROXY_PORT` | The port to run the proxy server on | `8080` |
+| `TARGET_BASE_URL` | Base URL for the target API | `https://planetarycomputer.microsoft.com` |
+| `TOKEN_ENDPOINT` | Endpoint for token requests | `https://planetarycomputer.microsoft.com/api/sas/v1/token` |
+| `TOKEN_CACHE_DIR` | Directory to store the token cache | `./cache` |
+| `TOKEN_CACHE_FILE` | Filename for the token cache | `token_cache.json` |
+| `REQUEST_TIMEOUT` | Timeout for HTTP requests (duration format) | `60s` |
+| `SAVE_PERIOD` | How often to save the token cache (duration format) | `5m` |
+
 ## Token Handling and URL Signing
 
 The proxy handles authentication to Microsoft Planetary Computer by:
@@ -193,6 +218,7 @@ The proxy handles authentication to Microsoft Planetary Computer by:
 - Intelligently signing Azure blob URLs with the correct token
 - Using a fallback "default-collection" when no specific collection is detected
 - Skipping token signing for public storage accounts (ai4edatasetspublicassets.blob.core.windows.net)
+- Storing tokens in a configurable cache directory for persistence between restarts
 
 This approach eliminates the need to manually manage tokens in your application.
 
