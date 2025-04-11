@@ -294,7 +294,7 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	if isSTACResponse(resp) {
-		transformedResp, err := transformSTACResponse(resp, collection)
+		transformedResp, err := transformSTACResponse(resp, collection, r.Host)
 		if err != nil {
 			http.Error(w, "Error transforming response", statusInternalServerError)
 			log.Printf("Error transforming response: %v", err)
@@ -339,7 +339,7 @@ func isSTACResponse(resp *http.Response) bool {
 		strings.Contains(contentType, "application/ld+json")
 }
 
-func transformSTACResponse(resp *http.Response, collectionID string) (*http.Response, error) {
+func transformSTACResponse(resp *http.Response, collectionID string, hostHeader string) (*http.Response, error) {
 	contentType := resp.Header.Get(headerContentType)
 	contentEncoding := resp.Header.Get(headerContentEncoding)
 
@@ -386,7 +386,10 @@ func transformSTACResponse(resp *http.Response, collectionID string) (*http.Resp
 		}
 	}
 
-	bodyStr = strings.ReplaceAll(bodyStr, config.TargetBaseURL, fmt.Sprintf("http://localhost:%d", config.ProxyPort))
+	// Use the host from the request instead of hardcoding localhost
+	proxyBaseURL := fmt.Sprintf("http://%s", hostHeader)
+	log.Printf("Using request host for URL replacement: %s", proxyBaseURL)
+	bodyStr = strings.ReplaceAll(bodyStr, config.TargetBaseURL, proxyBaseURL)
 
 	newResp := *resp
 	newResp.Header = resp.Header.Clone()
@@ -396,56 +399,6 @@ func transformSTACResponse(resp *http.Response, collectionID string) (*http.Resp
 	newResp.Header.Del(headerContentEncoding)
 
 	return &newResp, nil
-}
-
-func signBlobURLs(content, token string) string {
-	// Simple regex to detect all blob URLs that don't already have query parameters
-	blobURLRegex := regexp.MustCompile(`https://[^\.]+\.blob\.core\.windows\.net/[^"'\s?]+`)
-
-	// Find all matches in the content
-	matches := blobURLRegex.FindAllString(content, -1)
-	if len(matches) == 0 {
-		return content
-	}
-
-	modifiedContent := content
-	signedCount := 0
-
-	for _, originalURL := range matches {
-		// Skip URLs that already have a signature (containing '?')
-		if strings.Contains(originalURL, "?") {
-			continue
-		}
-		
-		// Skip specific storage accounts that don't need signing or have different auth
-		if strings.Contains(originalURL, "ai4edatasetspublicassets.blob.core.windows.net") {
-			log.Printf("Skipping token signing for public assets URL: %s", originalURL)
-			continue
-		}
-
-		// Add the token to the URL
-		signedURL := originalURL + "?" + token
-
-		// Replace in content, being careful with various JSON formats
-		modifiedContent = strings.Replace(
-			modifiedContent,
-			fmt.Sprintf("\"href\":\"%s\"", originalURL),
-			fmt.Sprintf("\"href\":\"%s\"", signedURL),
-			-1,
-		)
-
-		modifiedContent = strings.Replace(
-			modifiedContent,
-			fmt.Sprintf("\"url\":\"%s\"", originalURL),
-			fmt.Sprintf("\"url\":\"%s\"", signedURL),
-			-1,
-		)
-
-		signedCount++
-	}
-
-	log.Printf("Signed %d blob URLs", signedCount)
-	return modifiedContent
 }
 
 func findCollectionInResponse(content string) string {
@@ -726,4 +679,54 @@ func saveTokenCache() error {
 
 	log.Printf("Saved %d tokens to cache file", len(tokenCopy))
 	return nil
+}
+
+func signBlobURLs(content, token string) string {
+	// Simple regex to detect all blob URLs that don't already have query parameters
+	blobURLRegex := regexp.MustCompile(`https://[^\.]+\.blob\.core\.windows\.net/[^"'\s?]+`)
+
+	// Find all matches in the content
+	matches := blobURLRegex.FindAllString(content, -1)
+	if len(matches) == 0 {
+		return content
+	}
+
+	modifiedContent := content
+	signedCount := 0
+
+	for _, originalURL := range matches {
+		// Skip URLs that already have a signature (containing '?')
+		if strings.Contains(originalURL, "?") {
+			continue
+		}
+		
+		// Skip specific storage accounts that don't need signing or have different auth
+		if strings.Contains(originalURL, "ai4edatasetspublicassets.blob.core.windows.net") {
+			log.Printf("Skipping token signing for public assets URL: %s", originalURL)
+			continue
+		}
+
+		// Add the token to the URL
+		signedURL := originalURL + "?" + token
+
+		// Replace in content, being careful with various JSON formats
+		modifiedContent = strings.Replace(
+			modifiedContent,
+			fmt.Sprintf("\"href\":\"%s\"", originalURL),
+			fmt.Sprintf("\"href\":\"%s\"", signedURL),
+			-1,
+		)
+
+		modifiedContent = strings.Replace(
+			modifiedContent,
+			fmt.Sprintf("\"url\":\"%s\"", originalURL),
+			fmt.Sprintf("\"url\":\"%s\"", signedURL),
+			-1,
+		)
+
+		signedCount++
+	}
+
+	log.Printf("Signed %d blob URLs", signedCount)
+	return modifiedContent
 }
