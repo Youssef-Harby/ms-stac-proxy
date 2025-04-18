@@ -30,8 +30,6 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=ref,event=branch
-            type=sha
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
       
       - name: Log in to GitHub Container Registry
