@@ -126,6 +126,7 @@ func NewApplication() *Application {
 		},
 		httpClient: &http.Client{
 			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment, // Respect OS proxy settings
 				MaxIdleConnsPerHost: 100,
 				MaxConnsPerHost:     1000,
 				IdleConnTimeout:     90 * time.Second,
